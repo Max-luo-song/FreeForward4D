@@ -1,0 +1,59 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "freeforward4d"
+dynamic = ["version"]
+description = "FreeForward4D: RGB-derived geometry and dynamic Gaussian reconstruction (FreeForward-B/8)"
+requires-python = ">=3.10"
+license = "CC-BY-NC-4.0"
+license-files = ["LICENSE"]
+keywords = ["4D reconstruction", "gaussian splatting", "autonomous driving"]
+classifiers = [
+    "Programming Language :: Python :: 3.10",
+    "Environment :: GPU :: NVIDIA CUDA :: 12.8",
+    "Intended Audience :: Science/Research",
+]
+# Runtime dependencies (installable set with pins lives in requirements.txt;
+# scripts/setup.sh installs torch/torchvision from the cu128 index first, then
+# requirements.txt, then this package with --no-deps). Third-party packages keep
+# their own licenses; FreeForward4D itself is CC BY-NC 4.0 (see LICENSE).
+dependencies = [
+    "torch==2.10.0",
+    "torchvision==0.25.0",
+    "gsplat==1.5.3",
+    "numpy>=1.26,<2",
+    "open3d>=0.18",
+    "jaxtyping>=0.2.30",
+    "scipy>=1.11",
+    "matplotlib>=3.8",
+    "einops>=0.7",
+    "timm>=0.9",
+    "scikit-image>=0.22",
+    "imageio>=2.31",
+    "imageio-ffmpeg>=0.4",
+    "opencv-python-headless==4.11.0.86",
+    "Pillow>=10.0",
+    "wandb>=0.16",
+    "tensorboard>=2.14",
+    "plyfile>=1.0",
+    "requests>=2.31",
+    "tqdm>=4.65",
+    "lpips>=0.1.4",
+    "ninja>=1.11",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8"]
+
+[tool.setuptools.dynamic]
+version = { attr = "freeforward.__version__" }
+
+[tool.setuptools.packages.find]
+include = ["freeforward*"]
+
+[tool.setuptools.package-data]
+"freeforward.visualization" = ["*.png"]
+"freeforward.preprocessing" = ["*.json"]
+"freeforward.vendor" = ["UTILS3D_LICENSE"]

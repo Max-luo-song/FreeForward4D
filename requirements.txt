@@ -1,0 +1,30 @@
+# FreeForward4D training/runtime requirements (Python >= 3.10, 3.10 recommended).
+#
+# scripts/setup.sh installs torch/torchvision first from the official cu128 index
+# (https://download.pytorch.org/whl/cu128); the pins below match those wheels and are
+# already satisfied afterwards (a "+cu128" local version satisfies "==2.10.0").
+#
+# Third-party packages below are governed by their own licenses, kept with their
+# respective projects; the repository LICENSE (CC BY-NC 4.0) covers FreeForward4D only.
+torch==2.10.0
+torchvision==0.25.0
+gsplat==1.5.3
+numpy>=1.26,<2
+open3d>=0.18
+jaxtyping>=0.2.30
+scipy>=1.11
+matplotlib>=3.8
+einops>=0.7
+timm>=0.9
+scikit-image>=0.22
+imageio>=2.31
+imageio-ffmpeg>=0.4
+opencv-python-headless==4.11.0.86
+Pillow>=10.0
+wandb>=0.16
+tensorboard>=2.14
+plyfile>=1.0
+requests>=2.31
+tqdm>=4.65
+lpips>=0.1.4
+ninja>=1.11

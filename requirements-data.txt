@@ -1,0 +1,14 @@
+# FreeForward4D raw-data conversion environment (CPU only; used by
+# scripts/extract_waymo_rgb.py for authorized Waymo TFRecords).
+#
+# MUST be a separate environment from training: TensorFlow 2.12 requires
+# NumPy < 1.24, which conflicts with requirements.txt (NumPy >= 1.26).
+# Recommended: conda create -n freeforward-data python=3.10
+#              pip install -r requirements-data.txt
+#
+# Third-party packages are governed by their own licenses, kept with their
+# respective projects.
+numpy==1.23.5
+tensorflow-cpu==2.12.0
+waymo-open-dataset-tf-2-12-0
+Pillow>=9.5

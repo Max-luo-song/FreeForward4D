@@ -1,0 +1,14 @@
+{
+  "output_image_size": [
+    160,
+    240
+  ],
+  "window_frames": 20,
+  "window_stride": 1,
+  "window_batch_size": 8,
+  "min_overlap_poses": 9,
+  "cpu_threads": 4,
+  "raw_compression": "deflate",
+  "keep_intermediates": false,
+  "min_free_gib_per_gpu": 8.0
+}

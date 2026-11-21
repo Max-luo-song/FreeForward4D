@@ -1,0 +1,246 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>FreeForward4D: Annotation-Free Feed-Forward 4D Reconstruction of Driving Scenes</title>
+  <meta name="description" content="FreeForward4D reconstructs dynamic driving scenes in a single forward pass, trained and run with cameras, depth, and object tracks derived from RGB only.">
+  <meta name="theme-color" content="#ffffff">
+  <meta property="og:title" content="FreeForward4D">
+  <meta property="og:description" content="Annotation-free feed-forward reconstruction of dynamic driving scenes.">
+  <meta property="og:image" content="https://max-luo-song.github.io/FreeForward4D/assets/og.jpg">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Google+Sans:wght@400;500;700&family=Noto+Sans:wght@400;700&display=swap">
+  <link rel="stylesheet" href="styles.css?v=20261121-polish">
+</head>
+<body>
+  <header class="masthead">
+    <div class="title-lockup">
+      <img class="project-logo" src="assets/logo.png" width="1261" height="1247" alt="FreeForward4D logo">
+      <h1><span class="title-line">FreeForward4D: Annotation-Free Feed-Forward</span><span class="title-line">4D Reconstruction of Driving Scenes</span></h1>
+    </div>
+    <p class="project-tagline">From RGB videos to dynamic 4D driving scenes in a single forward pass.</p>
+    <p class="authors"><span class="author"><a href="https://max-luo-song.github.io/gls2000.github.io/">Luosong&nbsp;Guo</a><sup>1,2,*</sup></span> &nbsp;·
+  <span class="author"><a href="https://akkzzzz.github.io/">Xiang&nbsp;Yang</a><sup>1,2,*</sup></span> &nbsp;·
+  <span class="author"><a href="https://github.com/GiIfoyle">Chaoyang&nbsp;Li</a><sup>1,2</sup></span> &nbsp;·
+  <span class="author"><a href="https://yuhuoo.github.io/">Ao&nbsp;Gao</a><sup>1</sup></span> &nbsp;·
+  <span class="author"><a href="https://faculty.ecnu.edu.cn/_s16/sjm2/main.psp">Jiangming&nbsp;Shi</a><sup>1</sup></span> &nbsp;·
+  <span class="author"><a href="https://scholar.google.com/citations?user=idiP90sAAAAJ&amp;hl=en">Yanyun&nbsp;Qu</a><sup>3</sup></span> &nbsp;·
+  <span class="author"><a href="https://faculty.ecnu.edu.cn/_s16/zzz2/main.psp">Zhizhong&nbsp;Zhang</a><sup>1</sup></span> &nbsp;·
+  <span class="author"><a href="https://jingyugong.github.io">Jingyu&nbsp;Gong</a><sup>1</sup></span> &nbsp;·
+  <span class="author"><a href="https://scholar.google.com/citations?user=RN1QMPgAAAAJ&amp;hl=en&amp;oi=ao">Yuan&nbsp;Xie</a><sup>1,2,†</sup></span></p>
+    <p class="affiliations"><sup>1</sup> East China Normal University &nbsp;·&nbsp; <sup>2</sup> Shanghai Innovation Institute &nbsp;·&nbsp; <sup>3</sup> Xiamen University</p>
+    <p class="author-notes">* Equal contribution. † Corresponding author.<br>Work done during Xiang Yang’s internship at SII.</p>
+    <nav class="links" aria-label="Project links">
+      <a class="btn" href="https://github.com/Max-luo-song/FreeForward4D">
+        <svg aria-hidden="true" viewBox="0 0 16 16" width="16" height="16"><path fill="currentColor" d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
+        Code
+      </a>
+      <a class="btn" href="https://arxiv.org/pdf/2611.24007"><svg aria-hidden="true" viewBox="0 0 24 24" width="17" height="20"><path fill="currentColor" d="M5 1h9l6 6v16H5z"/><path fill="#363636" d="M14 1v7h6z"/><text x="6.5" y="18" fill="#363636" font-family="Arial,sans-serif" font-size="6.5" font-weight="700">PDF</text></svg> Paper</a>
+      <a class="btn" href="https://huggingface.co/Dwqy/FreeForward4D/tree/main"><span aria-hidden="true">🤗</span> Weights</a>
+    </nav>
+  </header>
+
+  <main>
+    <section aria-labelledby="project-video-heading">
+      <h2 id="project-video-heading">Project Video</h2>
+      <figure class="project-video">
+        <video controls playsinline preload="none" poster="assets/freeforward4d-demo-poster.jpg" aria-label="FreeForward4D project demonstration video">
+          <source src="assets/freeforward4d-demo.mp4" type="video/mp4">
+          Your browser does not support embedded video. <a href="assets/freeforward4d-demo.mp4">Download the project video</a>.
+        </video>
+      </figure>
+    </section>
+<section class="prose" aria-labelledby="abstract-heading">
+      <h2 id="abstract-heading">Abstract</h2>
+      <p>
+        Feed-forward 4D reconstruction enables efficient creation of renderable driving scenes for autonomous driving simulation. However, most existing methods rely heavily on dataset-provided cameras, LiDAR depth, or 3D box annotations, limiting their applicability to unannotated driving videos. Pretrained visual models can predict cameras, depth, and object tracks from RGB alone, but their geometry is mutually inconsistent: multi-view predictions come in short windows with independent scales and frames, while monocular depth is metric only per image. Our key insight is that, once reconciled into a single metric frame, these priors can replace dataset annotations for feed-forward 4D reconstruction. We present <b>FreeForward4D</b>, which calibrates overlapping prediction windows against monocular metric depth and registers them into one frame across time. On this geometry, 2D tracks are associated across cameras in 3D, and objects move through hierarchical motion that combines a shared object velocity with local Gaussian corrections, so that both training and inference use only RGB videos. On Waymo, FreeForward4D achieves 27.66 dB PSNR and 0.836 SSIM while recovering metric-scale cameras and depth without scale alignment. It surpasses STORM, SLARM-F, UFO, DGGT, and StreetForward, which rely on dataset annotations, in full-image PSNR and attains the best RGB fidelity on 8-second windows. RGB-only fine-tuning further adapts the framework to nuScenes and Argoverse 2. Code will be released.
+      </p>
+    </section>
+
+    <section aria-labelledby="demo-heading">
+      <h2 id="demo-heading">Demo Videos</h2>
+      <div class="models" role="group" aria-label="Model">
+        <button type="button" class="model" data-model="s2" aria-pressed="true">2&nbsp;s model</button>
+        <button type="button" class="model" data-model="s8" aria-pressed="false">8&nbsp;s model</button>
+      </div>
+      <figure class="player" data-player>
+        <div class="stage">
+          <canvas class="stage-canvas" role="img" aria-label="Rendered three-camera driving video compared with a second rendered layer"></canvas>
+          <span class="stage-label stage-label-left">Rendered RGB</span>
+          <span class="stage-label stage-label-right" data-right-label>Depth</span>
+          <div class="handle" role="slider" tabindex="0" aria-label="Comparison divider" aria-valuemin="0" aria-valuemax="100" aria-valuenow="50">
+            <span class="handle-grip" aria-hidden="true"></span>
+          </div>
+          <div class="stage-loading" aria-hidden="true"></div>
+        </div>
+        <div class="controls">
+          <button type="button" class="play" aria-label="Pause"><span aria-hidden="true" class="play-icon"></span></button>
+          <div class="modes" role="group" aria-label="Right side shows">
+            <button type="button" class="mode" data-layer="1" aria-pressed="true"><span class="swatch swatch-depth" aria-hidden="true"></span>Depth</button>
+            <button type="button" class="mode" data-layer="2" aria-pressed="false"><span class="swatch swatch-objects" aria-hidden="true"></span>Object Gaussians</button>
+          </div>
+          <div class="road" aria-hidden="true">
+            <div class="road-ticks"></div>
+            <div class="road-head"></div>
+          </div>
+        </div>
+        <figcaption data-player-caption></figcaption>
+      </figure>
+      <h3>More scenes</h3>
+      <p class="wall-note">Top: rendered RGB. Bottom: object Gaussians. Select a scene to compare its rendered RGB, depth, and object Gaussians in the player above.</p>
+      <div class="tile-wall" role="group" aria-label="Choose a scene"></div>
+    </section>
+
+    <section aria-labelledby="results-heading">
+      <h2 id="results-heading">Quantitative Results</h2>
+      <p class="lead">FreeForward4D is the only method here that uses no dataset annotations in either training or testing. It ranks second in full-image and dynamic-region PSNR on 2&nbsp;s clips and first in full-image PSNR and SSIM on 8&nbsp;s clips among the methods compared below.</p>
+
+      <div class="table-wrap">
+        <table>
+          <caption>Waymo 2&nbsp;s novel-time synthesis</caption>
+          <thead>
+            <tr><th rowspan="2" scope="col" class="left">Method</th><th colspan="2" scope="colgroup">Annotation-free</th><th colspan="2" scope="colgroup">Dynamic regions</th><th colspan="2" scope="colgroup">Full image</th><th scope="col">Depth</th></tr>
+            <tr><th scope="col">Train</th><th scope="col">Test</th><th scope="col">PSNR&uarr;</th><th scope="col">SSIM&uarr;</th><th scope="col">PSNR&uarr;</th><th scope="col">SSIM&uarr;</th><th scope="col">D-RMSE (m)&darr;</th></tr>
+          </thead>
+          <tbody>
+            <tr class="group"><th colspan="8" scope="colgroup" class="left">Pose-conditioned feed-forward methods</th></tr>
+            <tr><th scope="row" class="left">STORM (reprod.)</th><td class="no">&times;</td><td class="no">&times;</td><td>22.04</td><td>0.623</td><td>25.85</td><td>0.803</td><td>5.47</td></tr>
+            <tr><th scope="row" class="left">UFO</th><td class="no">&times;</td><td class="no">&times;</td><td>&ndash;</td><td>&ndash;</td><td>27.26</td><td>0.825</td><td>5.45</td></tr>
+            <tr><th scope="row" class="left">SLARM-F (reprod.)</th><td class="no">&times;</td><td class="no">&times;</td><td>22.95</td><td>0.672</td><td>26.98</td><td>0.827</td><td>4.78</td></tr>
+            <tr><th scope="row" class="left">PointForward</th><td class="no">&times;</td><td class="no">&times;</td><td><b>25.01</b></td><td><u>0.768</u></td><td><b>28.48</b></td><td><b>0.861</b></td><td><u>3.35</u></td></tr>
+            <tr class="group"><th colspan="8" scope="colgroup" class="left">Pose-free feed-forward methods</th></tr>
+            <tr><th scope="row" class="left">DGGT</th><td class="no">&times;</td><td class="yes">&#10003;</td><td>22.80</td><td>0.651</td><td>27.41</td><td><u>0.846</u></td><td>3.47</td></tr>
+            <tr><th scope="row" class="left">StreetForward</th><td class="no">&times;</td><td class="yes">&#10003;</td><td>24.30</td><td><b>0.827</b></td><td>27.01</td><td>0.818</td><td><b>3.14</b></td></tr>
+            <tr class="ours"><th scope="row" class="left">Ours</th><td class="yes">&#10003;</td><td class="yes">&#10003;</td><td><u>24.36</u></td><td>0.729</td><td><u>27.66</u></td><td>0.836</td><td>7.06</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="table-wrap">
+        <table>
+          <caption>Waymo 8&nbsp;s novel-time synthesis</caption>
+          <thead>
+            <tr><th scope="col" class="left">Method</th><th scope="col">PSNR&uarr;</th><th scope="col">SSIM&uarr;</th><th scope="col">D-RMSE (m)&darr;</th><th scope="col">Feed-forward</th><th scope="col">Annotation-free</th></tr>
+          </thead>
+          <tbody>
+            <tr><th scope="row" class="left">3DGS</th><td>19.57</td><td>0.517</td><td>14.42</td><td class="no">&times;</td><td class="no">&times;</td></tr>
+            <tr><th scope="row" class="left">PVG</th><td>22.90</td><td>0.619</td><td>18.24</td><td class="no">&times;</td><td class="no">&times;</td></tr>
+            <tr><th scope="row" class="left">Street Gaussians</th><td>21.69</td><td>0.609</td><td>13.17</td><td class="no">&times;</td><td class="no">&times;</td></tr>
+            <tr><th scope="row" class="left">DeformableGS</th><td>21.47</td><td>0.611</td><td>13.12</td><td class="no">&times;</td><td class="no">&times;</td></tr>
+            <tr><th scope="row" class="left">GS-LRM</th><td>21.81</td><td>0.584</td><td>7.37</td><td class="yes">&#10003;</td><td class="no">&times;</td></tr>
+            <tr><th scope="row" class="left">STORM</th><td>24.48</td><td>0.736</td><td>8.11</td><td class="yes">&#10003;</td><td class="no">&times;</td></tr>
+            <tr><th scope="row" class="left">STORM (iterative)</th><td>21.25</td><td>0.609</td><td>12.35</td><td class="yes">&#10003;</td><td class="no">&times;</td></tr>
+            <tr><th scope="row" class="left">UFO</th><td><u>27.39</u></td><td><u>0.830</u></td><td><b>5.10</b></td><td class="yes">&#10003;</td><td class="no">&times;</td></tr>
+            <tr class="ours"><th scope="row" class="left">Ours</th><td><b>27.57</b></td><td><b>0.836</b></td><td><u>7.11</u></td><td class="yes">&#10003;</td><td class="yes">&#10003;</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="note">
+        Bold / underline: best / second best. &#10003;: without dataset-provided geometric or object annotations; &times;: with such annotations. &ndash;: unreported.
+        2&nbsp;s: STORM and SLARM-F are locally reproduced and evaluated on the same 96,360 full novel-time images as Ours; other results are taken from the respective publications.
+        DGGT reports D-RMSE after linear alignment to LiDAR, whereas Ours is evaluated at the predicted metric scale without alignment; StreetForward optionally supervises depth with ground truth.
+        8&nbsp;s: 2,019 windows of 80 frames with 16 context frames; baselines are taken from UFO.
+      </p>
+    </section>
+
+    <section class="prose" aria-labelledby="method-heading">
+      <h2 id="method-heading">Method</h2>
+      <p>FreeForward4D consists of two components, enabling training and inference from RGB videos alone without dataset-provided cameras, LiDAR depth, or 3D box annotations.</p>
+      <p><b>(1) Metric-consistent geometric prior integration.</b> We calibrate the scales of overlapping multi-view prediction windows against monocular metric depth, register the windows into a single metric frame, and convert intrinsics to the reconstruction image grid. This provides consistent cameras, ray maps, and metric depth for reconstruction.</p>
+      <p><b>(2) Geometry-guided dynamic reconstruction.</b> A feed-forward reconstructor predicts Gaussians from sparse context frames and the calibrated geometry. We associate 2D object tracks across cameras through their 3D centers, model dynamics with a shared object velocity and local Gaussian motion, and fuse observations using object-wise, source-aware temporal weights for novel-time rendering.</p>
+    </section>
+    <figure class="figure method-figure">
+      <a class="pipeline-link" href="assets/pipeline-current.png" target="_blank" rel="noopener" aria-label="View the full-resolution FreeForward4D pipeline">
+        <img src="assets/pipeline-current.png" width="1665" height="865" loading="lazy"
+             alt="Current FreeForward4D architecture from the paper: (a) overall pipeline; (b) metric-consistent geometric prior integration with cross-model scale calibration and overlapping-window alignment; (c) geometry-guided dynamic reconstruction with cross-view object association, hierarchical motion modeling, and source-aware temporal fusion.">
+      </a>
+      <figcaption><b>FreeForward4D at a glance.</b> RGB-derived priors are aligned in a common metric frame, then used to reconstruct static geometry and object dynamics for novel-time rendering. <a href="assets/pipeline-current.png" target="_blank" rel="noopener">View full-resolution figure ↗</a></figcaption>
+    </figure>
+
+    <section aria-labelledby="qualitative-heading">
+      <h2 id="qualitative-heading">Qualitative Results</h2>
+      <figure class="closeups">
+        <div class="closeup-grid">
+          <span>GT</span><span>STORM</span><span>SLARM-F</span><span class="closeup-ours">Ours</span>
+          <img src="assets/figures/closeups/1-gt.jpg" width="288" height="192" loading="lazy" alt="GT, close-up 1">
+          <img src="assets/figures/closeups/1-storm.jpg" width="288" height="192" loading="lazy" alt="STORM, close-up 1">
+          <img src="assets/figures/closeups/1-slarm.jpg" width="288" height="192" loading="lazy" alt="SLARM-F, close-up 1">
+          <img src="assets/figures/closeups/1-ours.jpg" width="288" height="192" loading="lazy" alt="Ours, close-up 1">
+          <img src="assets/figures/closeups/2-gt.jpg" width="288" height="192" loading="lazy" alt="GT, close-up 2">
+          <img src="assets/figures/closeups/2-storm.jpg" width="288" height="192" loading="lazy" alt="STORM, close-up 2">
+          <img src="assets/figures/closeups/2-slarm.jpg" width="288" height="192" loading="lazy" alt="SLARM-F, close-up 2">
+          <img src="assets/figures/closeups/2-ours.jpg" width="288" height="192" loading="lazy" alt="Ours, close-up 2">
+          <img src="assets/figures/closeups/3-gt.jpg" width="288" height="192" loading="lazy" alt="GT, close-up 3">
+          <img src="assets/figures/closeups/3-storm.jpg" width="288" height="192" loading="lazy" alt="STORM, close-up 3">
+          <img src="assets/figures/closeups/3-slarm.jpg" width="288" height="192" loading="lazy" alt="SLARM-F, close-up 3">
+          <img src="assets/figures/closeups/3-ours.jpg" width="288" height="192" loading="lazy" alt="Ours, close-up 3">
+          <img src="assets/figures/closeups/4-gt.jpg" width="288" height="192" loading="lazy" alt="GT, close-up 4">
+          <img src="assets/figures/closeups/4-storm.jpg" width="288" height="192" loading="lazy" alt="STORM, close-up 4">
+          <img src="assets/figures/closeups/4-slarm.jpg" width="288" height="192" loading="lazy" alt="SLARM-F, close-up 4">
+          <img src="assets/figures/closeups/4-ours.jpg" width="288" height="192" loading="lazy" alt="Ours, close-up 4">
+        </div>
+        <figcaption>
+          Close-ups from four Waymo scenes, cropped at the same coordinates for all methods. Crops are selected where Ours has lower error than both baselines, so they show visible differences, not average performance; the tables above give the averages.
+        </figcaption>
+      </figure>
+      <figure class="figure">
+        <a href="assets/figures/qualitative.jpg">
+          <img src="assets/figures/qualitative.jpg" width="2125" height="951" loading="lazy"
+               alt="Waymo comparison at extrapolated timestamps: ground truth, STORM, SLARM-F, and Ours for the left, front, and right cameras, with enlarged regions.">
+        </a>
+        <figcaption>
+          Full views at extrapolated timestamps for the left, front, and right cameras. All methods are evaluated at the same target timestamps; both baselines use dataset-provided cameras, whereas ours uses RGB-estimated cameras.
+        </figcaption>
+      </figure>
+    </section>
+
+    <section aria-labelledby="tracks-heading">
+      <h2 id="tracks-heading">Gaussian Trajectories</h2>
+      <figure class="figure">
+        <a href="assets/figures/trajectories.jpg">
+          <img src="assets/figures/trajectories.jpg" width="1520" height="357" loading="lazy"
+               alt="Time-colored trajectories of selected Gaussians on moving vehicles over 1.5 seconds, drawn over renderings from virtual cameras raised by 0.5 meters.">
+        </a>
+        <figcaption>Time-colored trajectories of selected Gaussians on moving vehicles over 0&ndash;1.5&nbsp;s, drawn over renderings from virtual cameras elevated by 0.5&nbsp;m.</figcaption>
+      </figure>
+    </section>
+
+    <section aria-labelledby="static-heading">
+      <h2 id="static-heading">Scene-Level Static Reconstruction</h2>
+      <figure class="figure">
+        <a href="assets/figures/bev_zoomin.jpg">
+          <img src="assets/figures/bev_zoomin.jpg" width="2125" height="386" loading="lazy"
+               alt="Bird's-eye views and zoom-ins of static Gaussians merged from approximately 20 seconds of RGB.">
+        </a>
+        <figcaption>
+          Our calibrated metric cameras place static Gaussians predicted by the 8&nbsp;s model over approximately 20&nbsp;s into a common coordinate system, without per-scene optimization.
+          Each bird's-eye view and zoom-in pair shares one static Gaussian representation; orange arrows locate the virtual cameras.
+        </figcaption>
+      </figure>
+    </section>
+
+<section class="prose" aria-labelledby="citation-heading">
+      <h2 id="citation-heading">Citation</h2>
+      <pre><code>@article{guo2026freeforward4d,
+  title={FreeForward4D: Annotation-Free Feed-Forward 4D Reconstruction of Driving Scenes},
+  author={Guo, Luosong and Yang, Xiang and Li, Chaoyang and Gao, Ao and Shi, Jiangming and Qu, Yanyun and Zhang, Zhizhong and Gong, Jingyu and Xie, Yuan},
+  journal={arXiv preprint arXiv:2611.24007},
+  year={2026},
+  eprint={2611.24007},
+  archivePrefix={arXiv},
+  primaryClass={cs.CV},
+  url={https://arxiv.org/abs/2611.24007}
+}</code></pre>
+    </section>
+  </main>
+
+  <footer class="site-footer">
+    <p>Page layout based on the <a href="https://github.com/nerfies/nerfies.github.io">Nerfies</a> website template, licensed under <a href="https://creativecommons.org/licenses/by-sa/4.0/">CC BY-SA 4.0</a>.</p>
+  </footer>
+
+  <script src="scenes.js?v=20261104b"></script>
+  <script src="script.js?v=20261104b"></script>
+</body>
+</html>

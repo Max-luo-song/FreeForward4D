@@ -1,0 +1,2129 @@
+# Copyright (C) 2026 Xiaomi Corporation.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
+# implied. See the License for the specific language governing
+# permissions and limitations under the License.
+
+import argparse
+import copy
+import contextlib
+import datetime
+import hashlib
+import json
+import logging
+import math
+import os
+import signal
+import shutil
+import subprocess
+import sys
+import time
+from freeforward.utils.misc import update_scene
+
+import numpy as np
+import timm.optim.optim_factory as optim_factory
+import torch
+import torch.backends.cudnn as cudnn
+import torch.distributed as dist
+import torch.utils.data
+from torch.utils.tensorboard import SummaryWriter  # Add TensorBoard import
+from einops import rearrange, repeat
+import torch.nn.functional as F
+# FreeForward imports
+import freeforward.models as models
+import freeforward.utils.distributed as distributed
+import freeforward.utils.misc as misc
+from freeforward.utils.engine import evaluate, evaluate_flow, visualize
+from freeforward.dataset.constants import DATASET_DICT
+from freeforward.dataset.data_utils import prepare_inputs_and_targets
+from freeforward.dataset.samplers import DynamicMixtureSampler, InfiniteSampler, NoPaddingDistributedSampler
+from freeforward.dataset.dataset import FreeForwardDataset, FreeForwardDatasetEval
+from freeforward.utils.logging import MetricLogger, WandbLogger, setup_logging
+from freeforward.utils.losses import compute_loss
+from freeforward.utils.diagnostics import (
+    assignment_metrics, gaussian_metrics, parameter_grad_norms, reconstruction_metrics,
+)
+from freeforward.utils.lpips_loss import RGBLpipsLoss
+from freeforward.utils.misc import NativeScalerWithGradNormCount as NativeScaler
+from freeforward.utils.misc import combine_dict_entries, project_boxes_to_image, convert_to_chunks
+from freeforward.utils.misc import compute_point_visibility, compute_visible_topk_indices_any_view, batched_index_gather, batched_index_update
+from freeforward.ar import val
+from freeforward.paper_contract import assert_paper_training_ready
+from typing import Dict, Any, Optional
+
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+cudnn.benchmark = True
+
+
+# ============================================================================
+# TENSORBOARD LOGGER
+# ============================================================================
+
+class TensorBoardLogger:
+    def __init__(
+        self,
+        log_dir: str,
+        comment: str = "",
+        *,
+        distributed: bool = True,     # only used to detect rank; no collectives are called
+        purge_step: Optional[int] = None,
+        flush_secs: int = 30,
+        max_queue: int = 1000,
+    ):
+        """
+        Rank-zero-only TensorBoard logger:
+        - No all_reduce / cross-rank sync.
+        - No barriers.
+        - Only rank 0 creates a SummaryWriter and writes events.
+        """
+        self.step = 0
+
+        # Figure out rank without synchronizing.
+        dist_inited = distributed and dist.is_available() and dist.is_initialized()
+        if dist_inited:
+            try:
+                rank = dist.get_rank()
+            except Exception:
+                rank = int(os.getenv("RANK", "0"))
+        else:
+            # fall back to env var or assume single-process
+            rank = int(os.getenv("RANK", "0")) if distributed else 0
+
+        self.rank = rank
+        self.is_master = (self.rank == 0)
+
+        # Only master prepares the log dir and writer
+        self.writer = None
+        if self.is_master:
+            os.makedirs(log_dir, exist_ok=True)
+            self.writer = SummaryWriter(
+                log_dir,
+                comment=comment,
+                purge_step=purge_step,
+                flush_secs=flush_secs,
+                max_queue=max_queue,
+            )
+
+    # ---------- public API ----------
+
+    def set_step(self, step: Optional[int] = None):
+        """Set the current step for logging."""
+        if step is not None:
+            self.step = int(step)
+        else:
+            self.step += 1
+
+    def update(
+        self,
+        metrics_dict: Dict[str, Any],
+        *,
+        step: Optional[int] = None,
+        **_: Any,  # ignore any old kwargs like reduce/sync
+    ):
+        """
+        Log metrics to TensorBoard (rank 0 only).
+        - Accepts nested dicts: {tag: value} or {group_tag: {sub: value, ...}}
+        - Values can be int/float or torch.Tensor; tensors become local scalars.
+        - No cross-rank reduction; values reflect rank 0 only.
+        """
+        if step is not None:
+            self.set_step(step)
+
+        if not (self.is_master and self.writer is not None):
+            return  # no-op on non-master ranks
+
+        flat_scalars, grouped_scalars = {}, {}
+
+        for key, value in metrics_dict.items():
+            if isinstance(value, dict):
+                sub = {}
+                for sk, sv in value.items():
+                    sval = self._to_scalar_local(sv)
+                    if sval is not None:
+                        sub[sk] = sval
+                if sub:
+                    grouped_scalars[key] = sub
+            else:
+                sval = self._to_scalar_local(value)
+                if sval is not None:
+                    flat_scalars[key] = sval
+
+        for k, v in flat_scalars.items():
+            self.writer.add_scalar(k, v, self.step)
+        for k, sub in grouped_scalars.items():
+            self.writer.add_scalars(k, sub, self.step)
+
+    def flush(self):
+        if self.is_master and self.writer is not None:
+            self.writer.flush()
+
+    def close(self):
+        if self.is_master and self.writer is not None:
+            self.writer.close()
+
+    # ---------- helpers ----------
+
+    def log_image(self, tag: str, imgCHW: torch.Tensor, step: Optional[int] = None, every: int = 1000):
+        """Log an image [C,H,W] in [0,1] from rank 0 only."""
+        if step is not None:
+            self.set_step(step)
+        if self.is_master and self.writer is not None and (self.step % every == 0):
+            self.writer.add_image(tag, imgCHW, self.step)
+
+    def log_hist(self, tag: str, tensor: torch.Tensor, step: Optional[int] = None, every: int = 100):
+        """Log a histogram from rank 0 only."""
+        if step is not None:
+            self.set_step(step)
+        if self.is_master and self.writer is not None and (self.step % every == 0):
+            self.writer.add_histogram(tag, tensor.detach().float().cpu().numpy(), self.step)
+
+    def _to_scalar_local(self, v: Any) -> Optional[float]:
+        """
+        Convert int/float/tensor to a local float scalar on the current rank.
+        No device moves beyond what's needed to read a scalar.
+        """
+        if isinstance(v, (int, float)):
+            return float(v)
+        if isinstance(v, torch.Tensor):
+            t = v.detach()
+            if t.numel() == 0:
+                return None
+            t = t.float()
+            if t.numel() > 1:
+                t = t.mean()
+            # .item() will sync if t is on CUDA; that's fine on rank 0 only.
+            return float(t.item())
+        return None
+
+
+# ============================================================================
+# ARGUMENT PARSER
+# ============================================================================
+
+def get_args_parser():
+    parser = argparse.ArgumentParser("FreeForward training")
+
+    # =============== Configuration file ================= #
+    parser.add_argument("--config", type=str, default=None,
+                       help="Path to JSON config file (default: configs/default.json). CLI args override config values.")
+
+    # =============== Model parameters ================= #
+    parser.add_argument("--arch", default="small", type=str,
+                       help="Architecture type (e.g. 'small'). Selects which model class is built; "
+                            "see freeforward/models/archs/ for available types.")
+    parser.add_argument("--model", default="FreeForward-B/8", type=str,
+                       help="Backbone size identifier within the chosen --arch (e.g. FreeForward-B/8, FreeForward-L/8).")
+    parser.add_argument("--num_context_timesteps", default=4, type=int)
+    parser.add_argument("--num_target_timesteps", default=4, type=int)
+    parser.add_argument("--gs_dim", default=3, type=int, help="Number of gs dimensions")
+    parser.add_argument("--use_sky_token", action="store_true")
+    parser.add_argument("--use_affine_token", action="store_true")
+    parser.add_argument("--use_latest_gsplat", action="store_true")
+    parser.add_argument("--max_gaussian_scale", default=0.5, type=float,
+                        help="Hard upper bound applied after exponential Gaussian scale activation.")
+    parser.add_argument(
+        "--decoder_type",
+        type=str,
+        choices=["dummy", "conv"],
+        default="dummy",
+    )
+    parser.add_argument("--num_motion_tokens", default=16, type=int, help="Number of motion tokens")
+    parser.add_argument("--load_sam_tracks", action="store_true")
+    parser.add_argument("--sam_track_root", type=str, default="outputs/sam_tracks")
+    parser.add_argument("--sam_rigid_min_pixels", type=int, default=32)
+    parser.add_argument("--sam_rigid_max_speed", type=float, default=30.0)
+    parser.add_argument("--sam_dynamic_sigma", type=float, default=0.25)
+
+    parser.add_argument(
+        "--sam_motion_hidden_dim",
+        type=int,
+        default=384,
+    )
+    parser.add_argument(
+        "--sam_motion_max_speed",
+        type=float,
+        default=20.0,
+    )
+    parser.add_argument(
+        "--sam_motion_min_observations",
+        type=int,
+        default=2,
+    )
+    parser.add_argument(
+        "--train_sam_motion_only",
+        action="store_true",
+    )
+    parser.add_argument(
+        "--train_sam_r5",
+        action="store_true",
+    )
+    parser.add_argument(
+        "--sam_r5_min_track_pixels",
+        type=int,
+        default=16,
+    )
+    parser.add_argument(
+        "--sam_r5_association_max_distance",
+        type=float,
+        default=4.0,
+    )
+    parser.add_argument(
+        "--sam_r5_association_min_overlap",
+        type=int,
+        default=1,
+    )
+    parser.add_argument(
+        "--sam_r5_gs_lr_scale",
+        type=float,
+        default=0.1,
+    )
+    parser.add_argument(
+        "--sam_object_rgb_weight",
+        type=float,
+        default=5.0,
+    )
+    parser.add_argument(
+        "--sam_r6_voxel_size",
+        type=float,
+        default=0.12,
+    )
+    parser.add_argument(
+        "--sam_r6_min_voxel_support",
+        type=int,
+        default=1,
+    )
+    parser.add_argument(
+        "--train_sam_r6_fusion_only",
+        action="store_true",
+    )
+    parser.add_argument(
+        "--sam_canonical_fusion_impl",
+        choices=["gaussian_average", "feature_fusion"],
+        default="gaussian_average",
+        help="R6 Gaussian averaging or R9 feature-level canonical fusion.",
+    )
+    parser.add_argument("--r9_source_variant", choices=["r9", "source", "local", "cross"], default="r9")
+    parser.add_argument("--r9_source_sigma", type=float, default=.35)
+    parser.add_argument("--r9_local_motion_reg", type=float, default=1e-4)
+    parser.add_argument("--r9_cross_weight", type=float, default=.1)
+    parser.add_argument("--r9_cross_start", type=int, default=2000)
+    parser.add_argument("--r9_cross_ramp", type=int, default=1000)
+    parser.add_argument("--long_window_loss_reference_chunks", type=int, default=0)
+    parser.add_argument("--training_stage", default="2s")
+    parser.add_argument("--strict_checkpoint_load", action="store_true")
+    parser.add_argument("--debug_scene_exports", action="store_true")
+    parser.add_argument("--camera_pose_source", choices=["GT", "external", "unspecified"], default="unspecified")
+    parser.add_argument("--render_chunk_size", type=int, default=20)
+    parser.add_argument("--checkpoint_final_scene_render", action="store_true")
+    parser.add_argument("--r9_eval_every", type=int, default=0)
+    parser.add_argument("--r9_eval_starts", type=str, default="0,60,120,160")
+    parser.add_argument("--r9_motion_order", type=int, choices=[1, 2], default=1)
+    parser.add_argument("--r9_max_acceleration", type=float, default=6.0)
+    parser.add_argument("--r9_acceleration_reg", type=float, default=1e-4)
+    parser.add_argument("--r9_candidate_fusion", action="store_true")
+    parser.add_argument("--r9_candidate_radius", type=float, default=1.5)
+    parser.add_argument("--r9_candidate_min_cosine", type=float, default=0.2)
+    parser.add_argument("--sam_r9_hidden_dim", type=int, default=256)
+    parser.add_argument("--sam_r9_voxel_size", type=float, default=0.12)
+    parser.add_argument("--sam_r9_min_voxel_support", type=int, default=1)
+    parser.add_argument("--sam_r9_max_mean_residual", type=float, default=0.08)
+    parser.add_argument("--sam_r9_max_log_scale_residual", type=float, default=0.35)
+    parser.add_argument("--sam_r9_max_quat_residual", type=float, default=0.20)
+    parser.add_argument("--sam_r9_max_color_residual", type=float, default=0.25)
+    parser.add_argument("--sam_r9_spatial_prior", type=float, default=0.50)
+    parser.add_argument("--sam_r9_temporal_prior", type=float, default=0.25)
+    parser.add_argument(
+        "--sam_object_edge_weight",
+        type=float,
+        default=0.0,
+    )
+    parser.add_argument(
+        "--dynamic_renderer_mode",
+        choices=["bbox", "storm_velocity", "sam_rigid", "sam_object_motion", "sam_object_canonical", "sam_object_fusion"],
+        default="bbox",
+        help="bbox: legacy FreeForward bbox transform; storm_velocity: Gaussian velocity * delta_t.",
+    )
+    parser.add_argument("--filter_num", default=3600, type=int, help="Number of visible tokens to keep when filtering scene (k for top-k filtering)")
+
+    # =============== Losses =============== #
+    parser.add_argument("--enable_depth_loss", action="store_true")
+    parser.add_argument("--depth_cache_size", type=int, default=0,
+                        help="Bounded per-dataset CPU cache of resized Waymo depth maps; zero disables")
+    parser.add_argument("--depth_loss_coeff", type=float, default=1.0,
+                        help="Depth-loss multiplier; 1.0 preserves the public implementation.")
+    parser.add_argument("--depth_loss_normalization", choices=["target_max", "raw"],
+                        default="target_max", help="Depth L1 units used by the objective.")
+
+    # Option 1: push the sky depth to a fixed value
+    parser.add_argument("--enable_sky_depth_loss", action="store_true")
+    parser.add_argument("--sky_depth", type=float, default=300.0)
+    # Option 2: make sky gaussians transparent and use a sky token to represent sky
+    parser.add_argument("--enable_sky_opacity_loss", action="store_true")
+    parser.add_argument("--sky_opacity_loss_coeff", type=float, default=0.1)
+
+    # flow regularization loss
+    parser.add_argument("--enable_flow_reg_loss", action="store_true")
+    parser.add_argument("--flow_reg_coeff", type=float, default=0.005)
+
+    # Annotation-free local motion coherence.
+    # Penalizes neighboring Gaussians whose predicted velocities diverge.
+    parser.add_argument("--enable_motion_coherence_loss", action="store_true")
+    parser.add_argument("--motion_coherence_coeff", type=float, default=0.001)
+    parser.add_argument("--motion_coherence_beta", type=float, default=0.1)
+
+    # lifespan regularization loss (enabled by default)
+    parser.add_argument("--enable_lifespan_reg_loss", type=bool, default=True,
+                        help="Enable L1 regularization on lifespan to encourage persistent Gaussians")
+    parser.add_argument("--lifespan_reg_coeff", type=float, default=1e-4,
+                        help="Coefficient for lifespan L1 regularization loss")
+
+    # perceptual loss
+    parser.add_argument("--enable_perceptual_loss", action="store_true")
+    parser.add_argument("--perceptual_weight", default=0.05, type=float, help="LPIPS weight")
+    parser.add_argument("--perceptual_loss_start_iter", default=5000, type=int)
+
+    # ============= Optimizer and LR parameters ============= #
+    parser.add_argument("--lr", type=float, default=4e-4, help="learning rate (absolute lr)")
+    parser.add_argument("--blr", type=float, default=8e-4, help="base learning rate")
+    parser.add_argument("--min_lr", type=float, default=0.0)
+    parser.add_argument("--lr_sched", type=str, default="cosine", choices=["constant", "cosine"])
+    parser.add_argument("--warmup_iters", type=int, default=5000, help="iters to warmup LR")
+    parser.add_argument("--weight_decay", type=float, default=0.05)
+    parser.add_argument("--grad_clip", type=float, default=3.0, help="Gradient clip")
+    parser.add_argument("--disable_grad_checkpointing", action="store_true")
+    parser.add_argument("--sparse_training_diagnostics", action="store_true")
+    parser.add_argument("--diagnostic_interval", type=int, default=100)
+    parser.add_argument("--gaussian_diagnostic_interval", type=int, default=500)
+    parser.add_argument("--module_grad_norm_interval", type=int, default=500)
+    parser.add_argument("--benchmark_timing_output", default=None)
+    parser.add_argument("--benchmark_warmup_steps", type=int, default=20)
+    parser.add_argument("--equivalence_artifact", default=None)
+    parser.add_argument("--sequential_chunk_backward", action="store_true",
+                        help="Backward each detached recurrent chunk immediately, then take one optimizer step.")
+    parser.add_argument("--gradient_accumulation_steps", default=1, type=int,
+                        help="Dataloader microbatches per optimizer step; independent of recurrent chunks.")
+    parser.add_argument("--ddp_accumulation_no_sync", action="store_true",
+                        help="Synchronize DDP gradients only on the final accumulation microbatch.")
+    parser.add_argument("--ddp_smoke_assertions", action="store_true",
+                        help="Assert distinct rank data and synchronized gradients/parameters once.")
+    parser.add_argument("--detach_scene_between_chunks", action="store_true",
+                        help="Detach all recurrent scene tensors between chunks (truncated recurrent gradients).")
+    parser.add_argument("--allow_old_scene_grad", action="store_true",
+                        help="Keep old latent scene tokens attached for recurrent BPTT.")
+    parser.add_argument("--gaussian_decoder_layers", choices=["linear", "mlp2"], default="mlp2",
+                        help="Official-v1 Linear or paper-described 2-layer Gaussian decoder.")
+    parser.add_argument("--scene_token_input", choices=["official_rgb", "latent"], default="official_rgb",
+                        help="Encode visible old tokens from stored RGB (v1) or recurrent latent state (paper path).")
+    parser.add_argument("--attention_mode", choices=["official_v1_dense"], default="official_v1_dense",
+                        help="Released v1 dense SDPA. The paper custom flex-attention mask is not public.")
+    parser.add_argument("--enable_lifespan_renderer", action="store_true",
+                        help="Apply temporal Gaussian opacity in the renderer.")
+    parser.add_argument("--lifespan_parameterization", choices=["official_precision", "paper_beta"],
+                        default="official_precision")
+    parser.add_argument("--object_assignment_loss_coeff", type=float, default=0.01)
+    parser.add_argument("--object_assignment_background_weight", type=float, default=0.1)
+    parser.add_argument("--object_soft_target_temperature", type=float, default=0.1)
+    parser.add_argument(
+        "--training_assignment_mode",
+        choices=["predicted", "oracle_bbox"],
+        default="predicted",
+        help=(
+            "Dynamic ownership used during training. "
+            "oracle_bbox assigns each decoded Gaussian directly from GT 3D bbox geometry."
+        ),
+    )
+    parser.add_argument(
+        "--object_assignment_gt_mode",
+        choices=["predicted_mean", "lidar_anchor", "gaussian_coverage"],
+        default="predicted_mean",
+        help="Select the geometry used to construct token-level object labels.",
+    )
+    parser.add_argument("--object_gaussian_coverage_threshold", type=float, default=0.1)
+    parser.add_argument(
+        "--object_assignment_geometry_gate", action="store_true",
+        help="Gate broadcast token ownership using current Gaussian-to-bbox geometry.",
+    )
+    parser.add_argument(
+        "--object_geometry_gate_margin", type=float, default=0.5,
+        help="Metric falloff margin outside each oriented bbox; zero gives a hard inside gate.",
+    )
+    parser.add_argument("--training_sampling_mode", choices=["uniform", "dynamic_mixture"], default="uniform")
+    parser.add_argument("--dynamic_rich_pool", type=str, default=None)
+    parser.add_argument("--dynamic_sampling_ratio", type=float, default=0.0)
+    parser.add_argument(
+        "--instance_scene_index_manifest",
+        type=str,
+        default=None,
+        help="Optional scene-name mapping for Waymo instances; prevents annotation/index mismatch.",
+    )
+    parser.add_argument("--recurrent_aux_tokens", action="store_true",
+                        help="Carry updated sky/affine auxiliary tokens across recurrent chunks.")
+    parser.add_argument("--legacy_sky_full_opacity_loss", action="store_true",
+                        help="Keep the extra v1 full-image opacity-to-one loss when sky-depth loss is active.")
+    parser.add_argument("--disable_legacy_time_offset", action="store_true",
+                        help="Keep dataset-global normalized time instead of forcing every chunk context to -1.")
+    parser.add_argument("--paper_affine_transform", action="store_true",
+                        help="Use the paper A*c+b transform with identity initialization.")
+    parser.add_argument("--paper_bbox_rotation", action="store_true",
+                        help="Apply soft bbox-guided relative yaw to Gaussian quaternions.")
+    parser.add_argument("--mask_invalid_bbox_tokens", action="store_true",
+                        help="Exclude padded bbox tokens from soft assignment (v1 TODO fix).")
+    parser.add_argument("--stable_bbox_delta_transform", action="store_true",
+                        help="Blend bbox motion deltas instead of absolute means for BF16 stability.")
+    parser.add_argument("--paper_frame_protocol", action="store_true",
+                        help="Use every fifth frame as context and every other frame as supervision.")
+    parser.add_argument("--paper_supervision_mode", choices=["unknown", "per_chunk", "final_scene"],
+                        default="unknown", help="Undisclosed paper training render/loss timing.")
+    parser.add_argument("--paper_forward_flow_impl", action="store_true",
+                        help="Set only when an evidence-backed paper forward-flow implementation exists.")
+    parser.add_argument("--allow_missing_paper_components", action="store_true",
+                        help="Sprint-only override; logs missing flow/mask components without claiming contract equivalence.")
+
+    parser.add_argument("--start_iteration", default=0, type=int, help="start iteration")
+    parser.add_argument("--best_validation_psnr", default=-1.0, type=float,
+                        help="Best held-out gate PSNR persisted in checkpoints.")
+    parser.add_argument("--num_iterations", default=200_000, type=int, help="num of iterations")
+    parser.add_argument("--resume_from", default=None, help="resume from checkpoint")
+    parser.add_argument("--auto_resume", action="store_true")
+    parser.add_argument("--load_from", type=str, default=None)
+
+    # ============= Dataset parameters ============= #
+    parser.add_argument("--data_root", default="./data", type=str, help="dataset path")
+    parser.add_argument("--batch_size", default=8, type=int, help="Batch size per GPU")
+    parser.add_argument("--eval_batch_size", type=int, default=1)
+    parser.add_argument("--input_size", default=(160, 240), type=int, nargs=2)
+    parser.add_argument("--waymo_rgb_directory", choices=("images_4", "images"), default="images_4")
+    parser.add_argument("--num_max_cameras", type=int, default=3)
+    parser.add_argument("--timespan", type=float, default=2.0)
+    parser.add_argument("--load_ground", action="store_true")
+    parser.add_argument("--load_depth", action="store_true")
+    parser.add_argument("--load_flow", action="store_true")
+    parser.add_argument("--load_dynamic_mask", action="store_true",
+                        help="Load preprocessed dynamic masks for dynamic-region diagnostics.")
+    parser.add_argument("--dataset", default="waymo", type=str, choices=DATASET_DICT.keys())
+    parser.add_argument("--subset_ratio", default=1.0, type=float)
+    parser.add_argument(
+        "--train_scene_indices", default=None,
+        help="Comma-separated indices into the training annotation list.",
+    )
+    parser.add_argument("--disable_validation", action="store_true")
+    parser.add_argument("--num_workers", default=16, type=int)
+    parser.add_argument("--pin_memory", action="store_true")
+    parser.add_argument("--non_blocking_h2d", action="store_true")
+    parser.add_argument("--prefetch_factor", type=int, default=2)
+    parser.add_argument(
+        "--disable_train_flow_loading", action="store_true",
+        help="Skip GT flow I/O for training only; evaluation still loads GT flow.",
+    )
+    parser.add_argument("--skip_sky_mask", action="store_true", help="skip sky mask loading")
+
+    # ============= Pose-free training / camera override ============= #
+    parser.add_argument("--pose_override_dir", type=str, default=None)
+    parser.add_argument(
+        "--pose_override_mode",
+        choices=("none", "context", "all"),
+        default="none",
+    )
+    parser.add_argument("--intrinsics_override_dir", type=str, default=None)
+    parser.add_argument(
+        "--intrinsics_override_mode",
+        choices=("none", "context", "all"),
+        default="none",
+    )
+    parser.add_argument(
+        "--pose_override_sequence_dir",
+        type=str,
+        default=None,
+        help="Root containing start_NNN/<scene>/omega_pose_override.npz",
+    )
+    parser.add_argument(
+        "--intrinsics_override_sequence_dir",
+        type=str,
+        default=None,
+        help="Per-window root containing predicted intrinsics overrides",
+    )
+    parser.add_argument(
+        "--pose_free_camera_only",
+        action="store_true",
+        help="Use predicted cameras and suppress GT-world object trajectories",
+    )
+    parser.add_argument(
+        "--pose_free_coordinate_mode",
+        choices=("identity", "recurrent"),
+        default="identity",
+    )
+    parser.add_argument(
+        "--pose_free_training",
+        action="store_true",
+        help="Enable strict RGB + predicted-camera training contract",
+    )
+
+    parser.add_argument("--depth_supervision_only", action="store_true",
+                        help="Allow target-depth training loss while excluding all GT depth from model inputs")
+    parser.add_argument("--enable_pseudo_depth_loss", action="store_true",
+                        help="Use separate RGB-derived depth labels, with depth_loss_coeff")
+    parser.add_argument("--pseudo_depth_root", default=None)
+    parser.add_argument("--pseudo_depth_split", choices=("train", "val"), default="train")
+    parser.add_argument("--pseudo_depth_contract_id", default=None)
+
+    # ============= Logging ============= #
+    parser.add_argument("--output_dir", default="./output")
+    parser.add_argument("--num_vis_samples", type=int, default=1)
+    parser.add_argument("--log_every_n_iters", type=int, default=50)
+    parser.add_argument("--vis_every_n_iters", type=int, default=5000)
+    parser.add_argument("--ckpt_every_n_iters", type=int, default=5000)
+    parser.add_argument("--eval_every_n_iters", type=int, default=50000)
+    parser.add_argument(
+        "--validation_steps", default="",
+        help="Comma-separated optimizer steps for held-out validation.",
+    )
+    parser.add_argument("--total_elapsed_time", type=float, default=0.0, help="total time elapsed")
+    parser.add_argument("--keep_n_ckpts", default=5, type=int)
+
+    # ============= Miscellaneous ============= #
+    parser.add_argument("--seed", default=1, type=int)
+    parser.add_argument("--device", default="cuda", help="device to use for training / testing")
+    parser.add_argument("--visualization_only", action="store_true")
+    parser.add_argument("--evaluate", action="store_true")
+    parser.add_argument("--skip_initial_validation", action="store_true")
+    parser.add_argument("--skip_final_evaluation", action="store_true")
+
+    # ============= WandB and TensorBoard ============= #
+    parser.add_argument("--enable_wandb", action="store_true")
+    parser.add_argument("--enable_tensorboard", action="store_true", 
+                       help="Enable TensorBoard logging (default: True if wandb is not enabled)")
+    parser.add_argument("--project", default="debug", type=str)
+    parser.add_argument("--entity", default="YOUR_ENTITY", type=str)
+    parser.add_argument("--exp_name", default=None, type=str)
+    parser.add_argument("--overwrite_wandb", action="store_true")
+
+
+    parser.add_argument("--num_target_chunks", default=1, type=int)
+    parser.add_argument("--num_window_chunks", default=3, type=int)
+    parser.add_argument("--static", action="store_true")
+    parser.add_argument("--recurrent", action="store_true")
+    parser.add_argument("--num_mem_tokens", default=0, type=int)
+    parser.add_argument("--reverse", action="store_true")
+    parser.add_argument("--ar", action="store_true")
+    parser.add_argument("--num_bbox", default=32, type=int)
+
+    return parser
+
+
+# ============================================================================
+# UTILITY FUNCTIONS
+# ============================================================================
+
+def backup_python_files(backup_dir):
+    """Backup all Python files to the backup directory."""
+    if not os.path.exists(backup_dir):
+        os.makedirs(backup_dir, exist_ok=True)
+
+    # Get the root directory (current working directory)
+    root_dir = os.getcwd()
+
+    # Find all Python files recursively
+    for root, dirs, files in os.walk(root_dir):
+        # Skip backup directory itself, hidden directories, data directory, and output
+        excluded = {'data', 'output', 'outputs', 'runs', 'weights', 'checkpoints',
+                    'third_party', '__pycache__', os.path.basename(backup_dir)}
+        dirs[:] = [d for d in dirs if not d.startswith('.') and d not in excluded]
+
+        for file in files:
+            if file.endswith('.py'):
+                src_path = os.path.join(root, file)
+                # Create relative path for destination
+                rel_path = os.path.relpath(src_path, root_dir)
+                dst_path = os.path.join(backup_dir, rel_path)
+
+                # Create destination directory if needed
+                os.makedirs(os.path.dirname(dst_path), exist_ok=True)
+
+                # Copy the file
+                shutil.copy2(src_path, dst_path)
+
+    return backup_dir
+
+
+def _sha256(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def save_run_manifest(args, world_size, train_annotation, val_annotation):
+    def git(*command):
+        result = subprocess.run(["git", *command], text=True, capture_output=True)
+        return result.stdout.strip() if result.returncode == 0 else None
+
+    tracked_inputs = {
+        "train_scene_list": train_annotation,
+        "validation_scene_list": val_annotation,
+        "instance_scene_manifest": args.instance_scene_index_manifest,
+        "pseudo_depth_contract": os.path.join(args.pseudo_depth_root, "contract.json") if args.enable_pseudo_depth_loss else None,
+    }
+    diff_result = subprocess.run(["git", "diff", "--binary"], capture_output=True)
+    git_diff = diff_result.stdout if diff_result.returncode == 0 else b""
+    manifest = {
+        "command": [sys.executable, *sys.argv],
+        "git_commit": git("rev-parse", "HEAD"),
+        "git_status": git("status", "--short"),
+        "git_diff_stat": git("diff", "--stat"),
+        "git_diff_sha256": hashlib.sha256(git_diff).hexdigest(),
+        "hostname": os.uname().nodename,
+        "container_id": os.environ.get("HOSTNAME"),
+        "runtime": {
+            "python": sys.version,
+            "pytorch": torch.__version__,
+            "torch_cuda": torch.version.cuda,
+            "cudnn": torch.backends.cudnn.version(),
+            "nccl": torch.cuda.nccl.version() if torch.cuda.is_available() else None,
+            "torch_cuda_arch_list": os.environ.get("TORCH_CUDA_ARCH_LIST"),
+            "gpu_names": [torch.cuda.get_device_name(i) for i in range(torch.cuda.device_count())],
+            "gpu_capabilities": [torch.cuda.get_device_capability(i) for i in range(torch.cuda.device_count())],
+        },
+        "seed": args.seed,
+        "resolved_config": vars(args),
+        "training_scale": {
+            "world_size": world_size,
+            "batch_size_per_gpu": args.batch_size,
+            "gradient_accumulation_steps": args.gradient_accumulation_steps,
+            "effective_batch": world_size * args.batch_size * args.gradient_accumulation_steps,
+            "sequences_per_optimizer_step": world_size * args.batch_size * args.gradient_accumulation_steps,
+            "chunks_per_sequence": args.num_target_chunks,
+            "optimizer_step_definition": "one AdamW update after gradient_accumulation_steps sequences",
+        },
+        "inputs": {},
+    }
+    for name, path in tracked_inputs.items():
+        if path and os.path.exists(path):
+            manifest["inputs"][name] = {"path": path, "sha256": _sha256(path)}
+    with open(os.path.join(args.log_dir, "run_manifest.json"), "w") as handle:
+        json.dump(manifest, handle, indent=2, sort_keys=True)
+
+
+# ============================================================================
+# MAIN TRAINING FUNCTION
+# ============================================================================
+
+def main(args):
+    # ========================================================================
+    # Setup: Distributed training, logging, directories
+    # ========================================================================
+
+    distributed.enable(overwrite=True)
+
+    global logger
+    args.exp_name = args.model.replace("/", "-") if args.exp_name is None else args.exp_name
+    log_dir = os.path.join(args.output_dir, args.project, args.exp_name)
+    checkpoint_dir = os.path.join(log_dir, "checkpoints")
+    video_dir = os.path.join(log_dir, "videos")
+    backup_dir = os.path.join(log_dir, "backup")
+    tensorboard_dir = os.path.join("tensorboard", args.exp_name)  # Add tensorboard directory
+    args.log_dir, args.ckpt_dir, args.video_dir = log_dir, checkpoint_dir, video_dir
+
+    device = torch.device(args.device)
+    world_size, global_rank = distributed.get_world_size(), distributed.get_global_rank()
+    seed = args.seed + global_rank
+    misc.fix_random_seeds(seed)
+
+    log_writer = None
+    if global_rank == 0:
+        [os.makedirs(d, exist_ok=True) for d in [log_dir, checkpoint_dir, video_dir, backup_dir]]
+
+    if global_rank == 0 and args.enable_tensorboard:
+        os.makedirs(tensorboard_dir, exist_ok=True)
+        # Backup all Python files
+        backup_python_files(backup_dir)
+        
+        if args.enable_wandb:
+            # WandB logging
+            run_id_path, run_id = os.path.join(log_dir, "wandb_run_id.txt"), None
+            if os.path.exists(run_id_path) and not args.overwrite_wandb:
+                with open(run_id_path, "r") as f:
+                    run_id = f.readlines()[-1].strip()
+            log_writer = WandbLogger(args=args, resume="must", id=run_id)
+            if run_id is None:
+                with open(run_id_path, "a") as f:
+                    f.write(log_writer.run_id + "\n")
+        elif args.enable_tensorboard:
+            # TensorBoard logging (enabled by default if wandb is not enabled)
+            log_writer = TensorBoardLogger(
+                log_dir=tensorboard_dir, 
+                comment=f"{args.project}_{args.exp_name}"
+            )
+            # Log hyperparameters
+            if hasattr(log_writer, 'writer'):
+                log_writer.writer.add_text('hyperparameters', 
+                                            json.dumps(args.__dict__, indent=2), 0)
+
+    # set up logging
+    setup_logging(output=log_dir, level=logging.INFO)
+    logger = logging.getLogger("FreeForward")
+    logger.info(f"hostname: {os.uname().nodename}\n")
+    logger.info(f"job dir: {os.path.dirname(os.path.realpath(__file__))}")
+    logger.info(f"Logging to {log_dir}")
+    if global_rank == 0 and log_writer is not None:
+        if isinstance(log_writer, TensorBoardLogger):
+            logger.info(f"TensorBoard logging enabled. Run 'tensorboard --logdir {tensorboard_dir}' to view logs")
+        elif hasattr(log_writer, 'run_id'):
+            logger.info(f"WandB logging enabled with run_id: {log_writer.run_id}")
+    logger.info(json.dumps(args.__dict__, indent=4, sort_keys=True))
+    if global_rank == 0:
+        # Save final merged configuration
+        from freeforward.utils.config import save_config, args_to_dict
+        final_config = args_to_dict(args)
+        save_config(final_config, os.path.join(log_dir, "config.json"))
+        logger.info(f"Saved final configuration to {os.path.join(log_dir, 'config.json')}")
+
+    # ========================================================================
+    # Pose-free training contract
+    # ========================================================================
+
+    if args.enable_pseudo_depth_loss:
+        if args.load_depth or args.enable_depth_loss or args.load_flow:
+            raise ValueError("Pseudo supervision forbids the GT depth/flow training paths")
+        if not (args.pseudo_depth_root and args.pseudo_depth_contract_id and args.depth_supervision_only):
+            raise ValueError("Pseudo supervision requires a pinned cache contract and target-only supervision")
+    if args.depth_supervision_only:
+        if not (((args.load_depth and args.enable_depth_loss) or args.enable_pseudo_depth_loss) and args.depth_loss_coeff > 0):
+            raise ValueError("depth_supervision_only requires GT or pseudo depth loss with positive coefficient")
+        if not args.pose_free_camera_only:
+            raise ValueError("depth_supervision_only must keep GT instance inputs disabled")
+
+    if args.pose_free_training:
+        blockers = []
+
+        if not args.pose_free_camera_only:
+            blockers.append("pose_free_camera_only must be enabled")
+        if args.pose_free_coordinate_mode != "recurrent":
+            blockers.append("pose_free_coordinate_mode must be recurrent")
+
+        if args.pose_override_mode != "all":
+            blockers.append("pose_override_mode must be all")
+        if args.intrinsics_override_mode != "all":
+            blockers.append("intrinsics_override_mode must be all")
+
+        if not args.pose_override_dir and not args.pose_override_sequence_dir:
+            blockers.append(
+                "pose_override_dir or pose_override_sequence_dir is required"
+            )
+        if (
+            not args.intrinsics_override_dir
+            and not args.intrinsics_override_sequence_dir
+        ):
+            blockers.append(
+                "intrinsics_override_dir or "
+                "intrinsics_override_sequence_dir is required"
+            )
+
+        forbidden_flags = {
+            "load_depth": args.load_depth and not args.depth_supervision_only,
+            "load_flow": args.load_flow,
+            "load_ground": args.load_ground,
+            "load_dynamic_mask": args.load_dynamic_mask,
+            "enable_depth_loss": args.enable_depth_loss and not args.depth_supervision_only,
+            "enable_sky_depth_loss": args.enable_sky_depth_loss,
+            "enable_sky_opacity_loss": args.enable_sky_opacity_loss,
+        }
+
+        for name, enabled in forbidden_flags.items():
+            if enabled:
+                blockers.append(f"{name} must be disabled")
+
+        if not args.skip_sky_mask:
+            blockers.append("skip_sky_mask must be enabled")
+
+        # v1 deliberately disables the current bbox-motion path because
+        # the public renderer directly consumes GT target_instances_pose.
+        if args.object_assignment_loss_coeff != 0:
+            blockers.append(
+                "object_assignment_loss_coeff must be 0 in pose-free-training v1"
+            )
+
+        if args.paper_bbox_rotation:
+            blockers.append(
+                "paper_bbox_rotation must be disabled in pose-free-training v1"
+            )
+
+        if args.training_sampling_mode != "uniform":
+            blockers.append(
+                "formal pose-free training requires uniform window sampling"
+            )
+
+        if args.dynamic_rich_pool is not None:
+            blockers.append(
+                "dynamic_rich_pool must be null for formal uniform training"
+            )
+
+        if abs(args.dynamic_sampling_ratio) > 1e-8:
+            blockers.append(
+                "dynamic_sampling_ratio must be 0 for formal uniform training"
+            )
+
+        if not args.disable_validation:
+            blockers.append(
+                "validation must be disabled until pose-free validation is wired"
+            )
+
+        if blockers:
+            raise RuntimeError(
+                "POSE_FREE_TRAINING_CONTRACT failed:\n- "
+                + "\n- ".join(blockers)
+            )
+
+        logger.info(
+            "POSE_FREE_TRAINING_CONTRACT PASS: "
+            "RGB + configured camera pose/K overrides; "
+            "GT flow/ground/sky/dynamic/object trajectory disabled; "
+            "target-only depth supervision=%s source=%s coefficient=%s", args.depth_supervision_only,
+            "MoGe-pseudo" if args.enable_pseudo_depth_loss else ("GT" if args.enable_depth_loss else "none"), args.depth_loss_coeff
+        )
+
+    # ========================================================================
+    # Dataset initialization
+    # ========================================================================
+
+    dataset_meta = DATASET_DICT[args.dataset]
+    train_annotation = dataset_meta["annotation_txt_file_train"]
+    val_annotation = dataset_meta["annotation_txt_file_val"]
+    train_scene_indices = None
+    if args.train_scene_indices:
+        if isinstance(args.train_scene_indices, str):
+            train_scene_indices = [
+                int(value) for value in args.train_scene_indices.split(",") if value.strip()
+            ]
+        else:
+            train_scene_indices = [int(value) for value in args.train_scene_indices]
+    if train_annotation is not None:
+        if args.dataset == "nuscenes":
+            train_annotation = f"data/dataset_scene_list/nuscenes_train.txt"
+        else:
+            train_annotation = f"{args.data_root}/{train_annotation}"
+    if val_annotation is not None:
+        if args.dataset == "nuscenes":
+            val_annotation = f"data/dataset_scene_list/nuscenes_val.txt"
+        else:
+            val_annotation = f"{args.data_root}/{val_annotation}"
+        if not os.path.exists(val_annotation):
+            val_annotation = None
+    if args.disable_validation:
+        val_annotation = None
+
+    dataset_train = FreeForwardDataset(
+        data_root=args.data_root,
+        annotation_txt_file_list=train_annotation,
+        subset_indices=train_scene_indices,
+        target_size=args.input_size,
+        num_context_timesteps=args.num_context_timesteps,
+        num_target_timesteps=args.num_target_timesteps,
+        timespan=args.timespan,
+        num_max_cams=args.num_max_cameras,
+        load_depth=args.load_depth,
+        load_flow=args.load_flow and not args.disable_train_flow_loading,
+        load_dynamic_mask=args.load_dynamic_mask,
+        skip_sky_mask=args.skip_sky_mask,
+        num_target_chunks=args.num_target_chunks,
+        static=args.static,
+        reverse=args.reverse,
+        args=args
+    )
+    if args.training_sampling_mode == "uniform":
+        sampler_train = InfiniteSampler(sample_count=len(dataset_train), shuffle=True, seed=seed)
+    else:
+        if not args.dynamic_rich_pool:
+            raise ValueError("dynamic sampling requires --dynamic_rich_pool")
+        sampler_train = DynamicMixtureSampler(
+            sample_count=len(dataset_train),
+            rich_pool_path=args.dynamic_rich_pool,
+            rich_ratio=args.dynamic_sampling_ratio,
+            seed=seed,
+        )
+    train_loader_options = {}
+    if args.num_workers > 0:
+        train_loader_options["prefetch_factor"] = args.prefetch_factor
+    data_loader_train = torch.utils.data.DataLoader(
+        dataset_train,
+        sampler=sampler_train,
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
+        pin_memory=args.pin_memory,
+        persistent_workers=True if args.num_workers > 0 else False,
+        drop_last=True,
+        **train_loader_options,
+    )
+
+    if val_annotation is not None:
+        dataset_val = FreeForwardDataset(
+            data_root=args.data_root,
+            annotation_txt_file_list=val_annotation,
+            target_size=args.input_size,
+            num_context_timesteps=args.num_context_timesteps,
+            num_target_timesteps=args.num_target_timesteps,
+            timespan=args.timespan,
+            num_max_cams=args.num_max_cameras,
+            load_depth=args.load_depth,
+            load_flow=args.load_flow,
+            load_dynamic_mask=args.load_dynamic_mask,
+            skip_sky_mask=args.skip_sky_mask,
+            num_target_chunks=args.num_target_chunks,
+            static=args.static,
+            reverse=args.reverse,
+            args=args
+        )
+        dataset_eval = FreeForwardDatasetEval(
+            data_root=args.data_root,
+            annotation_txt_file_list=val_annotation,
+            target_size=args.input_size,
+            num_context_timesteps=args.num_context_timesteps,
+            num_target_timesteps=args.num_target_timesteps,
+            timespan=args.timespan,
+            num_max_cams=args.num_max_cameras,
+            load_depth=args.load_depth,
+            load_flow=args.load_flow,
+            load_dynamic_mask=True,
+            load_ground_label=args.load_ground,
+            skip_sky_mask=args.skip_sky_mask,
+            num_target_chunks=args.num_target_chunks,
+            static=args.static,
+            reverse=args.reverse,
+            args=args
+        )
+        dataset_eval_flow = FreeForwardDatasetEval(
+            data_root=args.data_root,
+            annotation_txt_file_list=val_annotation,
+            target_size=args.input_size,
+            num_context_timesteps=args.num_context_timesteps,
+            num_target_timesteps=args.num_target_timesteps,
+            timespan=args.timespan,
+            num_max_cams=args.num_max_cameras,
+            load_depth=args.load_depth,
+            load_flow=args.load_flow,
+            load_dynamic_mask=False,
+            load_ground_label=args.load_ground,
+            return_context_as_target=True,
+            skip_sky_mask=args.skip_sky_mask,
+            num_target_chunks=args.num_target_chunks,
+            static=args.static,
+            reverse=args.reverse,
+            args=args
+        )
+        sampler = NoPaddingDistributedSampler(
+            dataset_eval,
+            num_replicas=world_size,
+            rank=global_rank,
+            shuffle=False,
+        )
+        data_loader_eval = torch.utils.data.DataLoader(
+            dataset_eval,
+            batch_size=args.eval_batch_size,
+            num_workers=args.num_workers,
+            sampler=sampler,
+            pin_memory=False,
+            persistent_workers=True if args.num_workers > 0 else False,
+            shuffle=False,
+            drop_last=False,
+        )
+        data_loader_eval_flow = torch.utils.data.DataLoader(
+            dataset_eval_flow,
+            batch_size=args.eval_batch_size,
+            num_workers=args.num_workers,
+            sampler=sampler,
+            pin_memory=False,
+            persistent_workers=True if args.num_workers > 0 else False,
+            shuffle=False,
+            drop_last=False,
+        )
+    else:
+        dataset_val = None
+        dataset_eval = None
+        dataset_eval_flow = None
+        data_loader_eval = None
+        data_loader_eval_flow = None
+
+    logger.info(f"Dataset: {args.dataset}, train: {train_annotation}, val: {val_annotation}")
+    logger.info(f"Dataset contains {len(dataset_train):,} sequences using {train_annotation}.")
+
+    # ========================================================================
+    # Model initialization
+    # ========================================================================
+
+    if args.arch not in models.ARCHITECTURES:
+        raise ValueError(
+            f"Invalid arch: {args.arch!r}. "
+            f"Available architectures: {sorted(models.ARCHITECTURES.keys())}"
+        )
+    arch_models = models.ARCHITECTURES[args.arch]
+    if args.model not in arch_models:
+        raise ValueError(
+            f"Invalid model name {args.model!r} for arch={args.arch!r}. "
+            f"Available models for this arch: {sorted(arch_models.keys())}"
+        )
+    model = arch_models[args.model](
+        img_size=args.input_size,
+        gs_dim=args.gs_dim,
+        decoder_type=args.decoder_type,
+        grad_checkpointing=not args.disable_grad_checkpointing,
+        use_sky_token=args.use_sky_token,
+        use_affine_token=args.use_affine_token,
+        num_cams=args.num_max_cameras,
+        num_motion_tokens=args.num_motion_tokens,
+        use_latest_gsplat=args.use_latest_gsplat,
+        max_scale=args.max_gaussian_scale,
+        static=args.static,
+        num_mem_tokens=args.num_mem_tokens,
+        args=args
+    )
+
+    if getattr(
+        args,
+        "train_sam_motion_only",
+        False,
+    ):
+
+        if getattr(
+            model,
+            "sam_object_motion_head",
+            None,
+        ) is None:
+            raise RuntimeError(
+                "train_sam_motion_only requires "
+                "dynamic_renderer_mode="
+                "sam_object_motion"
+            )
+
+        for parameter in model.parameters():
+            parameter.requires_grad = False
+
+        for parameter in (
+            model.sam_object_motion_head
+            .parameters()
+        ):
+            parameter.requires_grad = True
+
+        trainable_names = [
+            name
+            for name, parameter
+            in model.named_parameters()
+            if parameter.requires_grad
+        ]
+
+        logger.info(
+            "SAM_OBJECT_MOTION_ONLY: "
+            "%d trainable tensors",
+            len(trainable_names),
+        )
+
+        logger.info(
+            "Trainable parameters: %s",
+            trainable_names,
+        )
+
+    if getattr(
+        args,
+        "train_sam_r5",
+        False,
+    ):
+
+        if (
+            getattr(
+                args,
+                "dynamic_renderer_mode",
+                None,
+            )
+            != "sam_object_canonical"
+        ):
+            raise RuntimeError(
+                "train_sam_r5 requires "
+                "dynamic_renderer_mode="
+                "sam_object_canonical"
+            )
+
+        if (
+            model.sam_object_motion_head
+            is None
+        ):
+            raise RuntimeError(
+                "R5 motion head missing"
+            )
+
+        # Freeze everything first.
+        for parameter in model.parameters():
+            parameter.requires_grad = False
+
+        # Object dynamics.
+        for parameter in (
+            model.sam_object_motion_head
+            .parameters()
+        ):
+            parameter.requires_grad = True
+
+        # Canonical Gaussian geometry / appearance.
+        for parameter in (
+            model.gs_pred.parameters()
+        ):
+            parameter.requires_grad = True
+
+        trainable_names = [
+            name
+            for name, parameter
+            in model.named_parameters()
+            if parameter.requires_grad
+        ]
+
+        logger.info(
+            "SAM_R5_CANONICAL_TRAINING: "
+            "%d trainable tensors",
+            len(trainable_names),
+        )
+
+        logger.info(
+            "R5 trainable parameters: %s",
+            trainable_names,
+        )
+
+    if getattr(
+        args,
+        "train_sam_r6_fusion_only",
+        False,
+    ):
+
+        if (
+            getattr(
+                args,
+                "dynamic_renderer_mode",
+                None,
+            )
+            != "sam_object_fusion"
+        ):
+            raise RuntimeError(
+                "train_sam_r6_fusion_only "
+                "requires "
+                "dynamic_renderer_mode="
+                "sam_object_fusion"
+            )
+
+        for parameter in model.parameters():
+            parameter.requires_grad = False
+
+        # Object-level motion.
+        for parameter in (
+            model.sam_object_motion_head
+            .parameters()
+        ):
+            parameter.requires_grad = True
+
+        # Gaussian geometry + appearance.
+        for parameter in (
+            model.gs_pred.parameters()
+        ):
+            parameter.requires_grad = True
+
+        # Camera color calibration remains useful
+        # for fused multi-view appearance.
+        if getattr(
+            model,
+            "affine_linear",
+            None,
+        ) is not None:
+            for parameter in (
+                model.affine_linear.parameters()
+            ):
+                parameter.requires_grad = True
+
+        trainable_names = [
+            name
+            for name, parameter
+            in model.named_parameters()
+            if parameter.requires_grad
+        ]
+
+        logger.info(
+            "SAM_R6_FUSION_ONLY: "
+            "%d trainable tensors",
+            len(trainable_names),
+        )
+
+        logger.info(
+            "R6 trainable parameters: %s",
+            trainable_names,
+        )
+
+    logger.info(f"Model = {str(model)}")
+    n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    logger.info(f"{args.model} Parameters: {n_params / 1e6:.2f}M ({n_params:,})")
+    model.to(device)
+    model_without_ddp = model
+
+    if distributed.is_enabled():
+        model = torch.nn.parallel.DistributedDataParallel(model, find_unused_parameters=True)
+        model_without_ddp = model.module
+    if args.gradient_accumulation_steps < 1:
+        raise ValueError("gradient_accumulation_steps must be >= 1")
+    global_batch_size = args.batch_size * world_size * args.gradient_accumulation_steps
+    if args.lr is None:  # only base_lr is specified
+        args.lr = args.blr * global_batch_size / 256
+    logger.info(
+        "Effective global batch size: %d (%d GPUs x %d/GPU x %d accumulation)",
+        global_batch_size, world_size, args.batch_size, args.gradient_accumulation_steps,
+    )
+    logger.info(f"Base lr: {args.lr * 256 / global_batch_size:.2e}, Actual lr: {args.lr:.2e}")
+
+    # ========================================================================
+    # Optimizer and loss scaler
+    # ========================================================================
+
+    if getattr(
+        args,
+        "train_sam_r5",
+        False,
+    ):
+        param_groups = []
+
+        motion_groups = (
+            optim_factory
+            .param_groups_weight_decay(
+                model_without_ddp
+                .sam_object_motion_head,
+                args.weight_decay,
+            )
+        )
+
+        for group in motion_groups:
+            group["lr_scale"] = 1.0
+
+        gs_groups = (
+            optim_factory
+            .param_groups_weight_decay(
+                model_without_ddp.gs_pred,
+                args.weight_decay,
+            )
+        )
+
+        for group in gs_groups:
+            group["lr_scale"] = (
+                args.sam_r5_gs_lr_scale
+            )
+
+        param_groups.extend(
+            motion_groups
+        )
+        param_groups.extend(
+            gs_groups
+        )
+
+    else:
+        param_groups = (
+            optim_factory
+            .param_groups_weight_decay(
+                model_without_ddp,
+                args.weight_decay,
+            )
+        )
+
+    optimizer = torch.optim.AdamW(
+        param_groups,
+        lr=args.lr,
+        betas=(0.9, 0.95),
+    )
+    loss_scaler = NativeScaler()
+
+    logger.info(f"Optimizer = {optimizer}")
+    logger.info(f"Loss Scaler = {loss_scaler}")
+
+    if args.r9_eval_every > 0:
+        import hashlib
+        initial_hash = hashlib.sha256()
+        for key, value in model_without_ddp.state_dict().items():
+            initial_hash.update(key.encode())
+            initial_hash.update(value.detach().cpu().contiguous().numpy().tobytes())
+        logger.info("R9_INITIAL_MODEL_SHA256 %s", initial_hash.hexdigest())
+
+    # Load checkpoint or resume training
+    logger.info(f"Original start Iteration: {args.start_iteration}")
+    vis_slice_id = misc.load_model(args, model_without_ddp, optimizer, loss_scaler)
+    logger.info(f"New start iteration {args.start_iteration}")
+    sampler_advance = args.start_iteration * args.gradient_accumulation_steps * args.batch_size
+    if hasattr(sampler_train, "set_advance"):
+        sampler_train.set_advance(sampler_advance)
+        logger.info("Advanced rank-local sampler stream by %d samples", sampler_advance)
+
+    num_trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    logger.info(f"{args.model} Trainable Parameters: {num_trainable_params / 1e6:.2f}M")
+    logger.info(f"Training with {world_size} GPUs")
+
+    data_iter_step = args.start_iteration
+    if log_writer is not None:
+        log_writer.set_step(data_iter_step)
+
+    # ========================================================================
+    # Evaluation and visualization
+    # ========================================================================
+
+    if args.evaluate:
+        eval_result = evaluate(data_loader_eval, model_without_ddp, args)
+        if log_writer is not None and eval_result is not None:
+            eval_result = {f"eval/{k}": v for k, v in eval_result.items()}
+            log_writer.update(eval_result)
+        if args.dataset == "waymo":
+            if args.decoder_type != "conv":
+                flow_eval_result = evaluate_flow(data_loader_eval_flow, model_without_ddp, args)
+                if log_writer is not None and flow_eval_result is not None:
+                    flow_eval_result = {f"eval/{k}": v for k, v in flow_eval_result.items()}
+                    log_writer.update(flow_eval_result)
+        logger.info("Evaluation done, exiting.")
+        exit()
+
+    valid_slice_id = copy.deepcopy(vis_slice_id)
+    if dataset_val is not None and valid_slice_id >= len(dataset_val):
+        valid_slice_id = 0
+
+    if not args.skip_initial_validation:
+        val(args, model_without_ddp, dataset_val, log_writer=log_writer, output_prefix=os.path.join(args.log_dir, "videos", f"{data_iter_step:07d}"))
+
+    if args.visualization_only:
+        logger.info("Visualization done, exiting.")
+        exit()
+
+    rgb_and_lpips_loss = RGBLpipsLoss(
+        perceptual_weight=args.perceptual_weight,
+        enable_perceptual_loss=args.enable_perceptual_loss,
+    ).to(device)
+    rgb_and_lpips_loss.set_perceptual_loss(False)
+    # ========================================================================
+    # Training loop
+    # ========================================================================
+
+    if args.allow_missing_paper_components:
+        logger.warning(
+            "MISSING_PAPER_COMPONENT: sprint override active; forward-flow and flex-mask gaps remain"
+        )
+    else:
+        assert_paper_training_ready(args)
+
+    from freeforward.utils.long_window_loss import backward_loss_scale
+    logger.info("LONG_WINDOW_LOSS_SCALE reference=%d chunks=%d scale=%g",
+                args.long_window_loss_reference_chunks, args.num_target_chunks,
+                backward_loss_scale(args.long_window_loss_reference_chunks, args.num_target_chunks))
+    if args.training_stage == "8s":
+        if args.num_target_chunks != 16 or args.num_max_cameras != 3:
+            raise ValueError("8s stage requires 16 chunks and three cameras")
+        if args.sequential_chunk_backward or args.detach_scene_between_chunks:
+            raise ValueError("8s final-scene training cannot detach or backward chunks independently")
+    logger.info(f"Starting training from iteration {args.start_iteration} to {args.num_iterations}")
+    if distributed.is_main_process():
+        save_run_manifest(args, world_size, train_annotation, val_annotation)
+    metrics_file = os.path.join(args.log_dir, "training_metrics.json")
+    metric_logger = MetricLogger(delimiter="  ", output_file=metrics_file)
+    start_time = time.time()
+    termination = {"signal": None}
+    ddp_smoke_state = {"data_checked": False, "gradient_checked": False, "parameter_checked": False}
+    benchmark_events = {"forward": [], "backward": [], "optimizer": [], "compute_step": []}
+    compute_step_start = None
+
+    def representative_tensor_checksum(tensor):
+        flat = tensor.detach().float().reshape(-1)
+        sample = flat[: min(flat.numel(), 4096)]
+        weights = torch.linspace(1.0, 2.0, sample.numel(), device=sample.device)
+        return torch.stack((sample.sum(), (sample * weights).sum(), sample.square().sum()))
+
+    def assert_all_ranks_close(value, label):
+        gathered = [torch.empty_like(value) for _ in range(world_size)]
+        torch.distributed.all_gather(gathered, value)
+        reference = gathered[0]
+        for rank, candidate in enumerate(gathered[1:], start=1):
+            if not torch.allclose(reference, candidate, rtol=1e-5, atol=1e-6):
+                raise RuntimeError(f"DDP smoke {label} mismatch between rank0 and rank{rank}")
+
+    def batch_fingerprint(batch):
+        first = batch[0] if isinstance(batch, (list, tuple)) else batch
+        scene_names = first.get("scene_name", [])
+        starts = first.get("sample_start_frame", [])
+        if torch.is_tensor(starts):
+            starts = starts.detach().cpu().tolist()
+        return repr((scene_names, starts))
+
+    def request_emergency_checkpoint(signum, _frame):
+        termination["signal"] = int(signum)
+
+    signal.signal(signal.SIGTERM, request_emergency_checkpoint)
+    signal.signal(signal.SIGINT, request_emergency_checkpoint)
+
+    def save_training_checkpoint(step, filename):
+        local_rng_state = misc.capture_rng_state()
+        rng_states = [None for _ in range(world_size)]
+        if world_size > 1:
+            torch.distributed.all_gather_object(rng_states, local_rng_state)
+        else:
+            rng_states[0] = local_rng_state
+        if distributed.is_main_process():
+            elapsed_t = time.time() - start_time + args.total_elapsed_time
+            checkpoint = {
+                "model": model_without_ddp.state_dict(),
+                "optimizer": optimizer.state_dict(),
+                "loss_scaler": loss_scaler.state_dict(),
+                "latest_step": step,
+                "vis_slice_id": vis_slice_id,
+                "args": args,
+                "total_elapsed_time": elapsed_t,
+                "rng_states": rng_states,
+                "sampler_advance_per_rank": (step + 1) * args.gradient_accumulation_steps * args.batch_size,
+                "scheduler_state": {
+                    "type": args.lr_sched,
+                    "warmup_iters": args.warmup_iters,
+                    "optimizer_step": step + 1,
+                },
+                "perceptual_loss_active": bool(
+                    args.enable_perceptual_loss and step + 1 >= args.perceptual_loss_start_iter
+                ),
+                "best_validation_psnr": args.best_validation_psnr,
+            }
+            checkpoint_path = os.path.join(args.ckpt_dir, filename)
+            torch.save(checkpoint, checkpoint_path + ".tmp")
+            os.replace(checkpoint_path + ".tmp", checkpoint_path)
+            misc.cleanup_checkpoints(args.ckpt_dir, keep_num=args.keep_n_ckpts)
+            logger.info("Saved checkpoint to %s", checkpoint_path)
+        if world_size > 1:
+            torch.distributed.barrier()
+    num_tokens_printed = False
+    micro_step = args.start_iteration * args.gradient_accumulation_steps
+    validation_steps = {
+        int(step) for step in args.validation_steps.split(",") if step.strip()
+    }
+    for data_dict in metric_logger.log_every(
+        data_loader_train,
+        print_freq=args.log_every_n_iters,
+        header="Training",
+        n_iterations=args.num_iterations * args.gradient_accumulation_steps,
+        start_iteration=micro_step,
+    ):
+        if micro_step >= args.num_iterations * args.gradient_accumulation_steps:
+            break
+        if micro_step < 3:
+            logger.info("R9_SAMPLE micro_step=%d %s", micro_step, batch_fingerprint(data_dict))
+        accumulation_index = micro_step % args.gradient_accumulation_steps
+        should_step = accumulation_index == args.gradient_accumulation_steps - 1
+        if args.ddp_smoke_assertions and world_size > 1 and not ddp_smoke_state["data_checked"]:
+            local_fingerprint = batch_fingerprint(data_dict)
+            fingerprints = [None for _ in range(world_size)]
+            torch.distributed.all_gather_object(fingerprints, local_fingerprint)
+            if len(set(fingerprints)) == 1:
+                raise RuntimeError(f"DDP smoke ranks consumed identical data: {fingerprints[0]}")
+            ddp_smoke_state["data_checked"] = True
+            logger.info("DDP smoke distinct rank data PASS: %s", fingerprints)
+        if accumulation_index == 0:
+            optimizer.zero_grad()
+            accumulation_loss_dict = {}
+            accumulation_metric_dict = {}
+            accumulation_scene_diagnostics = []
+            misc.adjust_learning_rate(optimizer, data_iter_step, args)
+            if args.benchmark_timing_output and data_iter_step >= args.benchmark_warmup_steps:
+                compute_step_start = torch.cuda.Event(enable_timing=True)
+                compute_step_start.record()
+        collect_step_diagnostics = (
+            not args.sparse_training_diagnostics
+            or data_iter_step % args.diagnostic_interval == 0
+        )
+        collect_gaussian_diagnostics = (
+            not args.sparse_training_diagnostics
+            or data_iter_step % args.gaussian_diagnostic_interval == 0
+        )
+        if log_writer is not None:
+            log_writer.set_step(data_iter_step)
+        if args.enable_perceptual_loss and data_iter_step >= args.perceptual_loss_start_iter:
+            rgb_and_lpips_loss.set_perceptual_loss(True)
+
+        model.train()
+        accumulation_sync_context = (
+            model.no_sync()
+            if (
+                args.ddp_accumulation_no_sync
+                and world_size > 1
+                and hasattr(model, "no_sync")
+                and not should_step
+            )
+            else contextlib.nullcontext()
+        )
+        accumulation_sync_context.__enter__()
+        benchmark_active = (
+            args.benchmark_timing_output
+            and data_iter_step >= args.benchmark_warmup_steps
+        )
+        forward_start = torch.cuda.Event(enable_timing=True) if benchmark_active else None
+        forward_end = torch.cuda.Event(enable_timing=True) if benchmark_active else None
+        if benchmark_active:
+            forward_start.record()
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            # Forward pass and loss computation
+            loss_total = 0
+            inout_dicts = prepare_inputs_and_targets(
+                data_dict,
+                device,
+                timespan=args.timespan,
+                from_list=True,
+                args=args,
+            )
+
+            # Verify the first real training batch, not only CLI flags.
+            if (
+                args.pose_free_training
+                and micro_step
+                == args.start_iteration * args.gradient_accumulation_steps
+            ):
+                forbidden_input = {
+                    "context_depth",
+                    "context_flow",
+                    "context_pseudo_depth", "target_pseudo_depth", "target_pseudo_depth_valid",
+                }
+                forbidden_target = {
+                    "target_depth",
+                    "target_flow",
+                    "context_flow",
+                    "target_dynamic_masks",
+                    "target_ground_masks",
+                }
+
+                if args.depth_supervision_only and args.enable_depth_loss:
+                    forbidden_target.discard("target_depth")
+
+                for chunk_index, (pf_input, pf_target) in enumerate(inout_dicts):
+                    if args.depth_supervision_only:
+                        required_depth = "target_pseudo_depth" if args.enable_pseudo_depth_loss else "target_depth"
+                        if required_depth not in pf_target:
+                            raise RuntimeError(f"target-only depth supervision has no {required_depth}")
+                        if args.enable_pseudo_depth_loss and "target_pseudo_depth_valid" not in pf_target:
+                            raise RuntimeError("Pseudo-depth validity mask is missing")
+                    bad_input = forbidden_input & set(pf_input)
+                    bad_target = forbidden_target & set(pf_target)
+
+                    if bad_input or bad_target:
+                        raise RuntimeError(
+                            "POSE_FREE_BATCH_CONTRACT failed at chunk "
+                            f"{chunk_index}: input={sorted(bad_input)}, "
+                            f"target={sorted(bad_target)}"
+                        )
+
+                    # skip_sky_mask currently materializes zero masks rather than
+                    # removing the tensor. Confirm they contain no GT signal.
+                    for name in ("context_sky_masks",):
+                        if name in pf_input and torch.count_nonzero(
+                            pf_input[name]
+                        ).item() != 0:
+                            raise RuntimeError(
+                                f"non-zero {name} found in pose-free batch"
+                            )
+
+                    for name in (
+                        "target_sky_masks",
+                        "context_sky_masks",
+                    ):
+                        if name in pf_target and torch.count_nonzero(
+                            pf_target[name]
+                        ).item() != 0:
+                            raise RuntimeError(
+                                f"non-zero {name} found in pose-free batch"
+                            )
+
+                    # v1 deliberately contains no GT object trajectory.
+                    for name in (
+                        "context_instances_id",
+                        "target_instances_id",
+                    ):
+                        if name in pf_input and torch.count_nonzero(
+                            pf_input[name]
+                        ).item() != 0:
+                            raise RuntimeError(
+                                f"GT object instances leaked through {name}"
+                            )
+
+                logger.info(
+                    "POSE_FREE_TRAINING_BATCH_CONTRACT PASS: "
+                    "%d recurrent chunks checked",
+                    len(inout_dicts),
+                )
+
+            all_gs_features = {}
+            loss_dict_accum = {}
+
+            if args.reverse:
+                range_inout = list(range(len(inout_dicts) - 1, -1, -1))
+            else:
+                range_inout = list(range(len(inout_dicts)))
+            final_scene_supervision = args.paper_supervision_mode == "final_scene"
+            final_scene_inputs = []
+            final_scene_update_outputs = []
+
+            # Autoregressive processing loop
+            for chunk_position, i in enumerate(range_inout):
+                input_dict, target_dict = inout_dicts[i]
+
+                sync_now = should_step and chunk_position == len(range_inout) - 1
+                sync_context = (
+                    contextlib.nullcontext()
+                    if (
+                        world_size == 1
+                        or not hasattr(model, "no_sync")
+                        or sync_now
+                        or not args.sequential_chunk_backward
+                    )
+                    else model.no_sync()
+                )
+                with sync_context:
+                    pred_dict, all_gs_features = update_scene(
+                        input_dict, model, scene=all_gs_features, export_ply=False,
+                        profile=False, render=not final_scene_supervision,
+                        filter_num=args.filter_num, log_dir=args.log_dir,
+                        detach_old_scene=not args.allow_old_scene_grad,
+                        collect_diagnostics=collect_step_diagnostics,
+                    )
+                    if final_scene_supervision:
+                        final_scene_inputs.append((input_dict, target_dict))
+                        final_scene_update_outputs.append(pred_dict)
+                    else:
+                        loss_dict = compute_loss(pred_dict, target_dict, args, rgb_and_lpips_loss)
+                        loss_dict.update({'class_loss': pred_dict['class_loss']})
+                        if 'ray_loss' in pred_dict:
+                            loss_dict.update({'ray_loss': pred_dict['ray_loss']})
+                        loss_value = sum(loss for k, loss in loss_dict.items() if "loss" in k)
+                        for key, value in loss_dict.items():
+                            loss_dict_accum[key] = loss_dict_accum.get(key, 0.0) + value.detach()
+                        if args.sequential_chunk_backward:
+                            if not args.detach_scene_between_chunks:
+                                raise ValueError("--sequential_chunk_backward requires --detach_scene_between_chunks")
+                            loss_scaler.backward(loss_value / args.gradient_accumulation_steps)
+                            loss_total += loss_value.detach()
+                        else:
+                            loss_total += loss_value
+
+                if not final_scene_supervision and collect_step_diagnostics:
+                    with torch.no_grad():
+                        chunk_metrics = reconstruction_metrics(pred_dict, target_dict)
+                        chunk_metrics.update(assignment_metrics(pred_dict))
+                        if collect_gaussian_diagnostics:
+                            chunk_metrics.update(gaussian_metrics(pred_dict, args.max_gaussian_scale))
+                        for key, value in chunk_metrics.items():
+                            accumulation_metric_dict[key] = accumulation_metric_dict.get(key, 0.0) + value
+                    accumulation_scene_diagnostics.append(pred_dict.get("scene_diagnostics", {}))
+
+                if args.detach_scene_between_chunks:
+                    all_gs_features = misc.detach_tensors(all_gs_features)
+
+            if final_scene_supervision:
+                if args.sequential_chunk_backward:
+                    raise ValueError(
+                        "final_scene supervision requires "
+                        "one backward after all renders"
+                    )
+
+                r6_cached_stage2 = None
+
+                if (
+                    args.dynamic_renderer_mode
+                    == "sam_object_fusion"
+                ):
+                    r6_stage2_input = (
+                        final_scene_inputs[
+                            0
+                        ][0].copy()
+                    )
+
+                    r6_stage2_input.update(
+                        all_gs_features
+                    )
+
+                    # R9 feature fusion requires RGB evidence aligned
+                    # one-to-one with the accumulated recurrent GS state.
+                    # final_scene_inputs is already in recurrent processing
+                    # order, exactly matching all_gs_features.
+                    if getattr(
+                        args,
+                        "sam_canonical_fusion_impl",
+                        "gaussian_average",
+                    ) == "feature_fusion":
+                        r6_stage2_input["r9_context_image"] = torch.cat(
+                            [
+                                chunk_input["context_image"]
+                                for chunk_input, _ in final_scene_inputs
+                            ],
+                            dim=1,
+                        )
+
+                    r6_cached_stage2 = model(
+                        r6_stage2_input,
+                        stage=2,
+                        motion=False,
+                    )
+
+                if collect_step_diagnostics and r6_cached_stage2 is not None:
+                    for key, value in r6_cached_stage2.items():
+                        if key.startswith(("r9_", "r5_")) and torch.is_tensor(value) and value.numel() == 1:
+                            # Diagnostic accumulator below divides by the number of chunks.
+                            accumulation_metric_dict[key] = value.detach() * len(inout_dicts)
+
+                for (
+                    render_source,
+                    target_dict,
+                ), update_output in zip(
+                    final_scene_inputs,
+                    final_scene_update_outputs,
+                ):
+
+                    render_input = (
+                        render_source.copy()
+                    )
+
+                    render_input.update(
+                        all_gs_features
+                    )
+
+                    if (
+                        r6_cached_stage2
+                        is not None
+                    ):
+                        render_input[
+                            "gs_params"
+                        ] = (
+                            r6_cached_stage2[
+                                "gs_params"
+                            ]
+                        )
+                    else:
+                        render_input = model(
+                            render_input,
+                            stage=2,
+                            motion=False,
+                        )
+
+                    if args.checkpoint_final_scene_render:
+                        from freeforward.utils.render_loss import final_scene_render_loss
+                        pred_dict, loss_dict = final_scene_render_loss(
+                            model, render_input, target_dict, args, rgb_and_lpips_loss)
+                    else:
+                        pred_dict = model(render_input, stage=3)
+                        loss_dict = compute_loss(pred_dict, target_dict, args, rgb_and_lpips_loss)
+                    if 'class_loss' in update_output:
+                        loss_dict['class_loss'] = update_output['class_loss']
+                    if 'ray_loss' in update_output:
+                        loss_dict['ray_loss'] = update_output['ray_loss']
+                    loss_value = sum(loss for key, loss in loss_dict.items() if "loss" in key)
+                    loss_total += loss_value
+                    for key, value in loss_dict.items():
+                        loss_dict_accum[key] = loss_dict_accum.get(key, 0.0) + value.detach()
+                    if collect_step_diagnostics:
+                        with torch.no_grad():
+                            chunk_metrics = reconstruction_metrics(pred_dict, target_dict)
+                            chunk_metrics.update(assignment_metrics(pred_dict))
+                            if collect_gaussian_diagnostics:
+                                chunk_metrics.update(gaussian_metrics(pred_dict, args.max_gaussian_scale))
+                            for key, value in chunk_metrics.items():
+                                accumulation_metric_dict[key] = accumulation_metric_dict.get(key, 0.0) + value
+
+            if args.r9_source_variant == "cross" and data_iter_step >= args.r9_cross_start:
+                if r6_cached_stage2 is None:
+                    raise RuntimeError("cross-time supervision requires a cached source-preserving scene")
+                from freeforward.models.source_dynamics import cross_time_rgb_loss
+                raw_cross, valid_ratio = cross_time_rgb_loss(model, r6_cached_stage2, final_scene_inputs, data_iter_step)
+                ramp = min(1., (data_iter_step - args.r9_cross_start + 1) / max(args.r9_cross_ramp, 1))
+                weighted_cross = raw_cross * args.r9_cross_weight * ramp * len(inout_dicts)
+                loss_total = loss_total + weighted_cross
+                loss_dict_accum["r9_cross_rgb_loss"] = weighted_cross.detach()
+                loss_dict_accum["r9_cross_rgb_raw"] = raw_cross.detach() * len(inout_dicts)
+                loss_dict_accum["r9_cross_valid_ratio"] = valid_ratio.detach() * len(inout_dicts)
+
+            loss_dict = {key: value / len(inout_dicts) for key, value in loss_dict_accum.items()}
+            for key, value in loss_dict.items():
+                accumulation_loss_dict[key] = accumulation_loss_dict.get(key, 0.0) + value
+
+        if benchmark_active:
+            forward_end.record()
+            benchmark_events["forward"].append((forward_start, forward_end))
+
+        if not torch.isfinite(loss_total.detach()).all():
+            nonfinite_losses = {
+                key: value.detach().float().cpu().tolist()
+                for key, value in loss_dict_accum.items()
+                if torch.is_tensor(value) and not torch.isfinite(value).all()
+            }
+            nonfinite_predictions = {
+                key: tuple(value.shape)
+                for key, value in pred_dict.items()
+                if torch.is_tensor(value) and not torch.isfinite(value).all()
+            }
+            logger.error(
+                "Non-finite total loss: losses=%s predictions=%s",
+                nonfinite_losses, nonfinite_predictions,
+            )
+            raise FloatingPointError("non-finite total loss")
+
+        backward_start = torch.cuda.Event(enable_timing=True) if benchmark_active else None
+        backward_end = torch.cuda.Event(enable_timing=True) if benchmark_active else None
+        if benchmark_active:
+            backward_start.record()
+        if not args.sequential_chunk_backward:
+            from freeforward.utils.long_window_loss import backward_loss_scale
+            length_scale = backward_loss_scale(args.long_window_loss_reference_chunks, len(inout_dicts))
+            loss_scaler.backward(loss_total * length_scale / args.gradient_accumulation_steps)
+        if benchmark_active:
+            backward_end.record()
+            benchmark_events["backward"].append((backward_start, backward_end))
+        accumulation_sync_context.__exit__(None, None, None)
+
+        micro_step += 1
+        if not should_step:
+            continue
+
+        if args.ddp_smoke_assertions and world_size > 1 and not ddp_smoke_state["gradient_checked"]:
+            gradient = next((parameter.grad for parameter in model.parameters() if parameter.grad is not None), None)
+            if gradient is None:
+                raise RuntimeError("DDP smoke found no gradient before optimizer step")
+            assert_all_ranks_close(representative_tensor_checksum(gradient), "gradient")
+            ddp_smoke_state["gradient_checked"] = True
+            logger.info("DDP smoke gradient all-reduce PASS")
+
+        if (
+            args.equivalence_artifact
+            and data_iter_step == args.start_iteration
+            and distributed.is_main_process()
+        ):
+            scale = float(loss_scaler._scaler.get_scale())
+            parameter_names = {
+                id(parameter): name for name, parameter in model_without_ddp.named_parameters()
+            }
+            equivalence_payload = {
+                "losses": {
+                    key: (value / args.gradient_accumulation_steps).detach().float().cpu()
+                    for key, value in accumulation_loss_dict.items()
+                },
+                "gradients": {
+                    name: parameter.grad.detach().float().cpu() / scale
+                    for name, parameter in model_without_ddp.named_parameters()
+                    if parameter.grad is not None
+                },
+                "model_keys": tuple(model_without_ddp.state_dict().keys()),
+                "optimizer_group_names": tuple(
+                    tuple(parameter_names[id(parameter)] for parameter in group["params"])
+                    for group in optimizer.param_groups
+                ),
+            }
+        optimizer_start = torch.cuda.Event(enable_timing=True) if benchmark_active else None
+        optimizer_end = torch.cuda.Event(enable_timing=True) if benchmark_active else None
+        if benchmark_active:
+            optimizer_start.record()
+        grad_norm = loss_scaler.step(
+            optimizer, parameters=model.parameters(), clip_grad=args.grad_clip
+        )
+        if benchmark_active:
+            optimizer_end.record()
+            benchmark_events["optimizer"].append((optimizer_start, optimizer_end))
+        collect_module_grad_norms = (
+            not args.sparse_training_diagnostics
+            or data_iter_step % args.module_grad_norm_interval == 0
+        )
+        grad_group_norms = (
+            parameter_grad_norms(model_without_ddp) if collect_module_grad_norms else {}
+        )
+        optimizer.zero_grad()
+        if (
+            args.equivalence_artifact
+            and data_iter_step == args.start_iteration
+            and distributed.is_main_process()
+        ):
+            equivalence_payload["parameters_after"] = {
+                name: parameter.detach().float().cpu()
+                for name, parameter in model_without_ddp.named_parameters()
+            }
+            artifact_path = Path(args.equivalence_artifact)
+            artifact_path.parent.mkdir(parents=True, exist_ok=True)
+            torch.save(equivalence_payload, artifact_path)
+        if args.ddp_smoke_assertions and world_size > 1 and not ddp_smoke_state["parameter_checked"]:
+            parameter = next(model.parameters())
+            assert_all_ranks_close(representative_tensor_checksum(parameter), "parameter")
+            ddp_smoke_state["parameter_checked"] = True
+            if distributed.is_main_process():
+                status_path = os.path.join(args.log_dir, "ddp_smoke_status.json")
+                with open(status_path, "w") as handle:
+                    json.dump({
+                        "distinct_rank_data": True,
+                        "gradient_all_reduce": True,
+                        "parameters_synchronized": True,
+                        "single_logical_checkpoint_writer": "rank0",
+                    }, handle, indent=2, sort_keys=True)
+            logger.info("DDP smoke synchronized parameters PASS")
+        loss_dict = {
+            key: value / args.gradient_accumulation_steps
+            for key, value in accumulation_loss_dict.items()
+        }
+        diagnostic_divisor = args.gradient_accumulation_steps * len(inout_dicts)
+        training_diagnostics = {
+            key: value / diagnostic_divisor for key, value in accumulation_metric_dict.items()
+        }
+        if world_size > 1:
+            [torch.distributed.all_reduce(v) for v in loss_dict.values()]
+        loss_dict_reduced = {k: v.item() / world_size for k, v in loss_dict.items()}
+        total_loss_reduced = sum(loss for k, loss in loss_dict_reduced.items() if "loss" in k)
+        lr = optimizer.param_groups[0]["lr"]
+        psnr = -10 * np.log10(loss_dict_reduced["rgb_loss"])
+        if args.sparse_training_diagnostics:
+            current_metric_names = {
+                "lr", "psnr", "loss", "grad_norm", "peak_gpu_mb", "optimizer_step",
+                *loss_dict_reduced.keys(), *training_diagnostics.keys(), *grad_group_norms.keys(),
+            }
+            for name in list(metric_logger.meters):
+                if name not in current_metric_names:
+                    del metric_logger.meters[name]
+        metric_logger.update(lr=lr, psnr=psnr, loss=total_loss_reduced, **loss_dict_reduced)
+        metric_logger.update(grad_norm=grad_norm)
+        metric_logger.update(optimizer_step=data_iter_step + 1)
+        metric_logger.update(peak_gpu_mb=torch.cuda.max_memory_allocated() / (1024 ** 2))
+        metric_logger.update(**training_diagnostics, **grad_group_norms)
+        if benchmark_active:
+            compute_step_end = torch.cuda.Event(enable_timing=True)
+            compute_step_end.record()
+            benchmark_events["compute_step"].append((compute_step_start, compute_step_end))
+
+        if "num_tokens" in pred_dict and not num_tokens_printed:
+            logger.info(f"num_tokens: {pred_dict['num_tokens']}")
+            num_tokens_printed = True
+
+        if log_writer is not None:
+            log_writer.update(
+                {
+                    "train/psnr": psnr,
+                    "train/loss": total_loss_reduced,
+                    **{f"train/{k}": v for k, v in loss_dict_reduced.items()},
+                    "train/lr": lr,
+                    "train/grad_norm": grad_norm,
+                    **{f"train/{k}": v for k, v in training_diagnostics.items()},
+                    **{f"train/{k}": v for k, v in grad_group_norms.items()},
+                }
+            )
+            for diagnostic in accumulation_scene_diagnostics[-len(inout_dicts):]:
+                chunk = diagnostic.get("chunk")
+                if chunk is not None:
+                    log_writer.update({
+                        f"scene/chunk{chunk}/{key}": value
+                        for key, value in diagnostic.items()
+                        if key != "chunk" and isinstance(value, (int, float))
+                    })
+            # Flush TensorBoard periodically
+            if isinstance(log_writer, TensorBoardLogger) and data_iter_step % 100 == 0:
+                log_writer.flush()
+
+        if (data_iter_step + 1) % args.ckpt_every_n_iters == 0:
+            save_training_checkpoint(data_iter_step, f"ckpt_{data_iter_step:06d}.pth")
+            torch.cuda.empty_cache()
+
+        termination_flag = torch.tensor(
+            int(termination["signal"] is not None), device=device, dtype=torch.int32
+        )
+        if world_size > 1:
+            torch.distributed.all_reduce(termination_flag, op=torch.distributed.ReduceOp.MAX)
+        if termination_flag.item():
+            save_training_checkpoint(data_iter_step, f"emergency_{data_iter_step:06d}.pth")
+            logger.warning("Emergency checkpoint completed after termination request")
+            return
+
+        completed_step = data_iter_step + 1
+        if (
+            completed_step in validation_steps
+            or (args.vis_every_n_iters > 0 and completed_step % args.vis_every_n_iters == 0)
+        ):
+            validation_metrics = val(
+                args,
+                model_without_ddp,
+                dataset_val,
+                log_writer=log_writer,
+                output_prefix=os.path.join(args.log_dir, "videos", f"{data_iter_step:07d}"),
+            )
+            validation_psnr = float(validation_metrics["psnr"])
+            if validation_psnr > args.best_validation_psnr:
+                args.best_validation_psnr = validation_psnr
+                save_training_checkpoint(data_iter_step, "best.pth")
+                logger.info(
+                    "New validation-best checkpoint: step=%d psnr=%.4f",
+                    completed_step,
+                    validation_psnr,
+                )
+
+        if args.r9_eval_every > 0 and (completed_step % args.r9_eval_every == 0 or completed_step == args.num_iterations):
+            if world_size != 1:
+                raise RuntimeError("R9 fixed-scene evaluation currently requires single-GPU jobs")
+            from freeforward.utils.r9_evaluate import evaluate_r9
+            result = evaluate_r9(model_without_ddp, dataset_train, args, completed_step)
+            logger.info("R9_FIXED_EVAL step=%d %s", completed_step, json.dumps(result, sort_keys=True))
+
+        data_iter_step += 1
+
+    metric_logger.synchronize_between_processes()
+    if args.benchmark_timing_output:
+        torch.cuda.synchronize()
+        timing = {}
+        for name, pairs in benchmark_events.items():
+            elapsed = [start.elapsed_time(end) / 1000.0 for start, end in pairs]
+            timing[name + "_seconds_mean"] = sum(elapsed) / max(len(elapsed), 1)
+            timing[name + "_samples"] = len(elapsed)
+        timing["peak_vram_mb"] = torch.cuda.max_memory_allocated() / (1024 ** 2)
+        if distributed.is_main_process():
+            timing_path = Path(args.benchmark_timing_output)
+            timing_path.parent.mkdir(parents=True, exist_ok=True)
+            timing_path.write_text(json.dumps(timing, indent=2, sort_keys=True) + "\n")
+
+    # ========================================================================
+    # Final evaluation
+    # ========================================================================
+
+    total_time = time.time() - start_time + args.total_elapsed_time
+    total_time_str = str(datetime.timedelta(seconds=int(total_time)))
+    logger.info("Training time {}".format(total_time_str))
+    if args.skip_final_evaluation:
+        logger.info("Skipping final evaluation by request.")
+        return
+    eval_result = evaluate(data_loader_eval, model_without_ddp, args)
+    if log_writer is not None and eval_result is not None:
+        log_writer.update({f"eval/{k}": v for k, v in eval_result.items()})
+    if args.decoder_type != "conv" and args.dataset == "waymo":
+        flow_eval_result = evaluate_flow(data_loader_eval_flow, model_without_ddp, args)
+        if log_writer is not None and flow_eval_result is not None:
+            log_writer.update({f"eval/{k}": v for k, v in flow_eval_result.items()})
+    logger.info("Done!")
+
+
+# ============================================================================
+# ENTRY POINT
+# ============================================================================
+
+if __name__ == "__main__":
+    import os
+    from pathlib import Path
+    from freeforward.utils.config import merge_config_and_args
+
+    parser = get_args_parser()
+
+    # Default config file path
+    default_config = Path("config.json")
+
+    # First parse to check if --config was specified
+    temp_args = parser.parse_args()
+
+    # Use specified config, or default if it exists
+    config_path = temp_args.config if temp_args.config else (str(default_config) if default_config.exists() else None)
+
+    # Merge config and args (CLI args take precedence)
+    args = merge_config_and_args(parser, config_path=config_path)
+
+    try:
+        main(args)
+    finally:
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            torch.distributed.destroy_process_group()
