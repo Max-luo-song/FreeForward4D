@@ -40,7 +40,7 @@
 
 ## Overview
 
-FreeForward4D reconstructs dynamic driving scenes using RGB-derived camera estimates, MoGe-2 depth predictions, and object tracks. The geometry frontend jointly estimates window scales and shared per-image depth offsets, then aligns overlapping camera predictions. The reconstruction network combines shared object velocity with local Gaussian trajectories and temporal weighting.
+**FreeForward4D turns unannotated multi-view RGB videos into metric-scale, renderable 4D driving scenes in a single forward pass.** Both training and inference use RGB alone, without dataset-provided cameras, LiDAR depth, or 3D bounding boxes. It reconciles pretrained visual priors in a common metric frame and couples object-level motion with local Gaussian dynamics to render driving scenes at novel times.
 
 <img src="docs/assets/pipeline-current.png" alt="FreeForward4D pipeline: metric-consistent geometric prior integration and geometry-guided dynamic reconstruction" width="100%">
 
